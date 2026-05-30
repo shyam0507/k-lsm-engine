@@ -5,6 +5,10 @@ import (
 	"sync"
 )
 
+const (
+	FLUSH_THRESOLD = 200
+)
+
 type Engine struct {
 	kv map[string]string
 	mu sync.RWMutex
@@ -37,6 +41,20 @@ func (e *Engine) Put(key, value string) {
 	defer e.mu.Unlock()
 
 	e.kv[key] = value
+
+	// flush the data to sstable if 3 entries (for debugging)
+	//TODO expose the value via env
+	if len(e.kv) == FLUSH_THRESOLD {
+		slog.Info("Flush threshold reached, calling SaveSSTable", "count", len(e.kv))
+		err := SaveSSTable(e.GetAll())
+		if err != nil {
+			slog.Error("SaveSSTable failed", "error", err)
+		} else {
+			slog.Info("SaveSSTable succeeded, clearing in-memory map")
+		}
+		clear(e.kv)
+	}
+
 	slog.Info("Key inserted/updated", "key", key)
 }
 

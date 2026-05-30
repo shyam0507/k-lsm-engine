@@ -33,11 +33,11 @@ func main() {
 		defer timer.ObserveDuration()
 
 		method := r.Method
-		path := r.URL.Path
+		key := r.URL.Path
 
 		switch method {
 		case "GET":
-			val, ok := e.Get(path)
+			val, ok := e.Get(key)
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -51,14 +51,12 @@ func main() {
 				return
 			}
 
-			e.Put(path, string(body))
+			e.Put(key, string(body))
 
-			// flush to ss table
-			storage.SaveSSTable(e.GetAll(), "sst-1.json")
 			fmt.Fprintf(w, "%s", body)
 
 		case "DELETE":
-			e.Delete(path)
+			e.Delete(key)
 
 		default:
 			w.Header().Set("Allow", "GET, PUT, DELETE")
