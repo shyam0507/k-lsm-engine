@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -21,22 +23,41 @@ func init() {
 	ManifestFilePath = filepath.Join(DataDir, "manifest.txt")
 }
 
-// SSTableEntry represents a key-value pair in the SSTable
-type SSTableEntry struct {
+// ssTableEntry represents a key-value pair in the table
+type ssTableEntry struct {
 	K string `json:"k"`
 	V string `json:"v"`
 }
 
+type ssTable struct {
+	tables  []string
+	counter int //for the sstable name
+}
+
+func NewSSTable() *ssTable {
+	tables, count, err := getAllSSTables()
+
+	if err != nil {
+		log.Fatal("Error while parsing/loading sstable", err)
+	}
+
+	return &ssTable{
+		tables:  tables,
+		counter: count,
+	}
+}
+
 // Function to return the ss table name from manifest file
-func getSSTableName() (string, error) {
-	// Open manifest file in read-only mode to get the last line
+func getAllSSTables() ([]string, int, error) {
+	tables := make([]string, 0)
+	counter := 0
+
 	f, err := os.Open(ManifestFilePath)
 	if err != nil {
-		// If file does not exist, start with sst-1.json
 		if os.IsNotExist(err) {
-			return "sst-1.json", nil
+			return tables, counter, nil
 		}
-		return "", err
+		return tables, counter, err
 	}
 	defer f.Close()
 
@@ -44,95 +65,127 @@ func getSSTableName() (string, error) {
 	var lastLine string
 	for scanner.Scan() {
 		lastLine = scanner.Text()
+		tables = append(tables, lastLine)
 	}
 	if err := scanner.Err(); err != nil {
 		slog.Error("Error while getting data", "err", err)
-		return "", err
+		return tables, counter, err
 	}
 
-	var fName string
-	if lastLine == "" {
-		fName = "sst-1.json"
-	} else {
-		// Extract the number and increment it
+	if lastLine != "" {
 		parts := strings.Split(lastLine, "-")
-		if len(parts) < 2 {
-			fName = "sst-1.json"
-		} else {
-			numPart := strings.TrimSuffix(parts[1], ".json")
-			// Try to parse and increment
-			var num int
-			_, err := fmt.Sscanf(numPart, "%d", &num)
+		if len(parts) >= 2 {
+			numPart := strings.TrimSuffix(parts[1], ".txt")
+			_, err := fmt.Sscanf(numPart, "%d", &counter)
 			if err != nil {
-				num = 1
-			} else {
-				num++
+				counter = 0
 			}
-			fName = fmt.Sprintf("sst-%d.json", num)
 		}
 	}
-	return fName, nil
+
+	//Reverse the table because the latest information will be in latest table
+	slices.Reverse(tables)
+	return tables, counter, nil
 }
 
-func SaveSSTable(m map[string]string) error {
+func (sst *ssTable) getSSTableName() string {
+	sst.counter++
+	return fmt.Sprintf("sst-%d.txt", sst.counter)
+}
+
+func (sst *ssTable) saveSSTable(m map[string]string) error {
 	slog.Info("SaveSSTable called")
-	fileName, err := getSSTableName()
-	if err != nil {
-		slog.Error("Error while getting SSTable name", "err", err)
-		return err
-	}
-
-	SSTable := make([]SSTableEntry, 0, len(m))
-	for k, v := range m {
-		e := SSTableEntry{
-			K: k,
-			V: v,
-		}
-		SSTable = append(SSTable, e)
-		slog.Debug("Added entry to SSTable", "key", k, "value", v)
-	}
-
-	data, err := json.MarshalIndent(SSTable, "", " ")
-	if err != nil {
-		slog.Error("Failed to marshal SSTable", "error", err)
-		return err
-	}
+	fileName := sst.getSSTableName()
 
 	filePath := filepath.Join(DataDir, fileName)
 	absFilePath, absErr := filepath.Abs(filePath)
 	if absErr != nil {
 		slog.Error("Failed to get absolute file path", "file", filePath, "error", absErr)
 	} else {
-		slog.Info("Absolute SSTable file path", "absFilePath", absFilePath)
+		slog.Info("Absolute table file path", "absFilePath", absFilePath)
 	}
 	// Ensure the sstable directory exists
 	dirPath := filepath.Dir(filePath)
-	err = os.MkdirAll(dirPath, 0755)
+	err := os.MkdirAll(dirPath, 0755)
 	if err != nil {
 		slog.Error("Failed to create sstable directory", "dir", dirPath, "error", err)
 		return err
 	}
 
-	err = os.WriteFile(filePath, data, 0644)
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		slog.Error("Failed to write SSTable file", "file", filePath, "error", err)
-		return err
-	}
-	slog.Info("SSTable file written", "file", filePath)
-
-	// now append the name to manifest file
-	f, err := os.OpenFile(ManifestFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		slog.Error("Failed to open manifest file", "file", ManifestFilePath, "error", err)
+		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
 		return err
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(fileName + "\n"); err != nil {
+	for k, v := range m {
+		entry := ssTableEntry{K: k, V: v}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
+			return err
+		}
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
+			return err
+		}
+		slog.Debug("Added entry to SSTable", "key", k, "value", v)
+	}
+	slog.Info("SSTable file written in JSON Lines format", "file", filePath)
+
+	// now append the name to manifest file
+	mf, err := os.OpenFile(ManifestFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Error("Failed to open manifest file", "file", ManifestFilePath, "error", err)
+		return err
+	}
+	defer mf.Close()
+
+	if _, err := mf.WriteString(fileName + "\n"); err != nil {
 		slog.Error("Failed to write to manifest file", "file", ManifestFilePath, "error", err)
 		return err
 	}
 	slog.Info("SSTable written to disk with name", "name", fileName)
 
+	//add the entry to the table
+	sst.tables = append([]string{fileName}, sst.tables...)
+
 	return nil
+}
+
+func (sst *ssTable) getKey(key string) (string, bool) {
+	for _, v := range sst.tables {
+		f, err := os.Open(filepath.Join(DataDir, v))
+		if err != nil {
+			slog.Error("Error while reading the ss table")
+			log.Fatal(err)
+		}
+
+		scanner := bufio.NewScanner(f)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			slog.Info("Read line", "data", line)
+			if line == "" {
+				continue
+			}
+
+			var entry ssTableEntry
+			err := json.Unmarshal([]byte(line), &entry)
+
+			if err != nil {
+				log.Fatalf("error during reading sstable: %s", err)
+			}
+
+			if key == entry.K {
+				return entry.V, true
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Fatalf("error during reading sstable: %s", err)
+		}
+	}
+	return "", false
 }

@@ -2,57 +2,62 @@ package storage
 
 import (
 	"log/slog"
-	"sync"
 )
 
+// TODO expose the value via env
 const (
-	FLUSH_THRESOLD = 200
+	FLUSH_THRESOLD = 2000
 )
 
 type Engine struct {
-	kv map[string]string
-	mu sync.RWMutex
+	memTable *memTable
+	ssTable  *ssTable
 }
 
 func NewEngine() *Engine {
 	slog.Info("Creating new Engine instance")
+	mem := newMemTable()
+	table := NewSSTable()
 	return &Engine{
-		kv: make(map[string]string),
+		memTable: mem,
+		ssTable:  table,
 	}
 }
 
 func (e *Engine) Get(key string) (string, bool) {
 	slog.Info("Get called", "key", key)
-	e.mu.RLock()
-	defer e.mu.RUnlock()
 
-	val, ok := e.kv[key]
+	val, ok := e.memTable.get(key)
+
 	if ok {
-		slog.Info("Key found", "key", key, "value", val)
-	} else {
-		slog.Warn("Key not found", "key", key)
+		slog.Info("Key found in Mem Table", "key", key, "value", val)
+		return val, ok
 	}
+
+	// Get data from sstable
+	val, ok = e.ssTable.getKey(key)
+	if ok {
+		slog.Info("Key found in ss table", "key", key, "value", val)
+		return val, ok
+	}
+
 	return val, ok
 }
 
 func (e *Engine) Put(key, value string) {
 	slog.Info("Put called", "key", key, "value", value)
-	e.mu.Lock()
-	defer e.mu.Unlock()
 
-	e.kv[key] = value
+	e.memTable.put(key, value)
 
-	// flush the data to sstable if 3 entries (for debugging)
-	//TODO expose the value via env
-	if len(e.kv) == FLUSH_THRESOLD {
-		slog.Info("Flush threshold reached, calling SaveSSTable", "count", len(e.kv))
-		err := SaveSSTable(e.GetAll())
+	if len(e.memTable.kv) == FLUSH_THRESOLD {
+		slog.Info("Flush threshold reached, calling SaveSSTable", "count", len(e.memTable.kv))
+		err := e.ssTable.saveSSTable(e.memTable.getAll())
 		if err != nil {
 			slog.Error("SaveSSTable failed", "error", err)
 		} else {
 			slog.Info("SaveSSTable succeeded, clearing in-memory map")
 		}
-		clear(e.kv)
+		clear(e.memTable.kv)
 	}
 
 	slog.Info("Key inserted/updated", "key", key)
@@ -60,14 +65,7 @@ func (e *Engine) Put(key, value string) {
 
 func (e *Engine) Delete(key string) {
 	slog.Info("Delete called", "key", key)
-	e.mu.Lock()
-	defer e.mu.Unlock()
 
-	delete(e.kv, key)
-	slog.Info("Key deleted", "key", key)
-}
-
-func (e *Engine) GetAll() map[string]string {
-	slog.Info("GetAll called")
-	return e.kv
+	// Add a tombstone
+	e.memTable.put(key, "")
 }
