@@ -27,9 +27,9 @@ func main() {
 	}
 
 	transport := &http.Transport{
-		MaxConnsPerHost:       100,
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       300,
+		MaxIdleConns:          600,
+		MaxIdleConnsPerHost:   300,
 		IdleConnTimeout:       30 * time.Second,
 		ForceAttemptHTTP2:     false,
 		DisableCompression:    true,

@@ -22,8 +22,8 @@ func (mem *memTable) get(key string) (string, bool) {
 	mem.mu.RLock()
 	defer mem.mu.RUnlock()
 
-	val, ok := mem.kv[key]
-	return val, ok
+	val := mem.kv[key]
+	return val, val != ""
 }
 
 func (mem *memTable) put(key, value string) {
@@ -36,5 +36,7 @@ func (mem *memTable) put(key, value string) {
 
 func (mem *memTable) getAll() map[string]string {
 	slog.Info("memTable getAll called")
+	mem.mu.RLock()
+	defer mem.mu.RUnlock()
 	return mem.kv
 }
