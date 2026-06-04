@@ -119,8 +119,17 @@ func (sst *ssTable) saveSSTable(m map[string]string) error {
 	}
 	defer f.Close()
 
-	for k, v := range m {
-		entry := ssTableEntry{K: k, V: v}
+	//sort keys before storing
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+
+	slices.Sort(keys)
+
+	for _, k := range keys {
+		v := m[k]
+		entry := ssTableEntry{K: k, V: m[k]}
 		line, err := json.Marshal(entry)
 		if err != nil {
 			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)

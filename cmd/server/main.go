@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -33,7 +34,7 @@ func main() {
 		defer timer.ObserveDuration()
 
 		method := r.Method
-		key := r.URL.Path
+		key := strings.TrimPrefix(r.URL.Path, "/")
 
 		switch method {
 		case "GET":
