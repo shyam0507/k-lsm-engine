@@ -6,21 +6,22 @@ import (
 
 // TODO expose the value via env
 const (
-	FLUSH_THRESOLD = 2000
+	FLUSH_THRESHOLD = 2000
 )
 
 type Engine struct {
 	memTable *memTable
+	wal      *wal
 	ssTable  *ssTable
 }
 
 func NewEngine() *Engine {
 	slog.Info("Creating new Engine instance")
-	mem := newMemTable()
-	table := NewSSTable()
+
 	return &Engine{
-		memTable: mem,
-		ssTable:  table,
+		memTable: newMemTable(),
+		wal:      NewWAL(walDirPath()),
+		ssTable:  NewSSTable(sstableDirPath()),
 	}
 }
 
@@ -49,7 +50,7 @@ func (e *Engine) Put(key, value string) {
 
 	e.memTable.put(key, value)
 
-	if len(e.memTable.kv) == FLUSH_THRESOLD {
+	if len(e.memTable.kv) == FLUSH_THRESHOLD {
 		slog.Info("Flush threshold reached, calling SaveSSTable", "count", len(e.memTable.kv))
 		err := e.ssTable.saveSSTable(e.memTable.getAll())
 		if err != nil {

@@ -12,16 +12,9 @@ import (
 	"strings"
 )
 
-// Always use project root for data directory
-var (
-	DataDir          string
-	ManifestFilePath string
+const (
+	MANIFEST_FILE_NAME = "manifest.db"
 )
-
-func init() {
-	DataDir = filepath.Join("data", "sstable")
-	ManifestFilePath = filepath.Join(DataDir, "manifest.txt")
-}
 
 // ssTableEntry represents a key-value pair in the table
 type ssTableEntry struct {
@@ -30,29 +23,34 @@ type ssTableEntry struct {
 }
 
 type ssTable struct {
-	tables  []string
-	counter int //for the sstable name
+	tables       []string
+	counter      int //for the sstable name
+	dir          string
+	manifestPath string
 }
 
-func NewSSTable() *ssTable {
-	tables, count, err := getAllSSTables()
+func NewSSTable(dir string) *ssTable {
+	tables, count, err := getAllSSTables(dir)
 
 	if err != nil {
 		log.Fatal("Error while parsing/loading sstable", err)
 	}
 
 	return &ssTable{
-		tables:  tables,
-		counter: count,
+		tables:       tables,
+		counter:      count,
+		dir:          dir,
+		manifestPath: filepath.Join(dir, MANIFEST_FILE_NAME),
 	}
 }
 
-// Function to return the ss table name from manifest file
-func getAllSSTables() ([]string, int, error) {
+// getAllSSTables reads the manifest file from the SSTable directory and returns
+// loaded table names in reverse order plus the current counter.
+func getAllSSTables(dir string) ([]string, int, error) {
 	tables := make([]string, 0)
 	counter := 0
 
-	f, err := os.Open(ManifestFilePath)
+	f, err := os.Open(filepath.Join(dir, MANIFEST_FILE_NAME))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return tables, counter, nil
@@ -90,14 +88,14 @@ func getAllSSTables() ([]string, int, error) {
 
 func (sst *ssTable) getSSTableName() string {
 	sst.counter++
-	return fmt.Sprintf("sst-%d.txt", sst.counter)
+	return fmt.Sprintf("%s%d.txt", ssTablePrefix, sst.counter)
 }
 
 func (sst *ssTable) saveSSTable(m map[string]string) error {
 	slog.Info("SaveSSTable called")
 	fileName := sst.getSSTableName()
 
-	filePath := filepath.Join(DataDir, fileName)
+	filePath := filepath.Join(sst.dir, fileName)
 	absFilePath, absErr := filepath.Abs(filePath)
 	if absErr != nil {
 		slog.Error("Failed to get absolute file path", "file", filePath, "error", absErr)
@@ -144,15 +142,15 @@ func (sst *ssTable) saveSSTable(m map[string]string) error {
 	slog.Info("SSTable file written in JSON Lines format", "file", filePath)
 
 	// now append the name to manifest file
-	mf, err := os.OpenFile(ManifestFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	mf, err := os.OpenFile(sst.manifestPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		slog.Error("Failed to open manifest file", "file", ManifestFilePath, "error", err)
+		slog.Error("Failed to open manifest file", "file", sst.manifestPath, "error", err)
 		return err
 	}
 	defer mf.Close()
 
 	if _, err := mf.WriteString(fileName + "\n"); err != nil {
-		slog.Error("Failed to write to manifest file", "file", ManifestFilePath, "error", err)
+		slog.Error("Failed to write to manifest file", "file", sst.manifestPath, "error", err)
 		return err
 	}
 	slog.Info("SSTable written to disk with name", "name", fileName)
@@ -165,7 +163,7 @@ func (sst *ssTable) saveSSTable(m map[string]string) error {
 
 func (sst *ssTable) getKey(key string) (string, bool) {
 	for _, v := range sst.tables {
-		f, err := os.Open(filepath.Join(DataDir, v))
+		f, err := os.Open(filepath.Join(sst.dir, v))
 		if err != nil {
 			slog.Error("Error while reading the ss table")
 			log.Fatal(err)
