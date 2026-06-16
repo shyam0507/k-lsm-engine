@@ -20,33 +20,53 @@ func NewEngine() *Engine {
 
 	return &Engine{
 		memTable: newMemTable(),
-		wal:      NewWAL(walDirPath()),
-		ssTable:  NewSSTable(sstableDirPath()),
+		wal:      newWAL(walDirPath()),
+		ssTable:  newSSTable(sstableDirPath()),
 	}
 }
 
 func (e *Engine) Get(key string) (string, bool) {
 	slog.Info("Get called", "key", key)
 
-	val, ok := e.memTable.get(key)
+	entry, ok := e.memTable.get(key)
 
 	if ok {
-		slog.Info("Key found in Mem Table", "key", key, "value", val)
-		return val, ok
+		if entry.Type == entryTypeDelete {
+			slog.Info("Key deleted in Mem Table", "key", key)
+			return "", false
+		}
+
+		slog.Info("Key found in Mem Table", "key", key, "value", entry.Value)
+		return entry.Value, true
 	}
 
 	// Get data from sstable
-	val, ok = e.ssTable.getKey(key)
+	entry, ok = e.ssTable.getKey(key)
 	if ok {
-		slog.Info("Key found in ss table", "key", key, "value", val)
-		return val, ok
+		if entry.Type == entryTypeDelete {
+			slog.Info("Key deleted in ss table", "key", key)
+			return "", false
+		}
+
+		slog.Info("Key found in ss table", "key", key, "value", entry.Value)
+		return entry.Value, true
 	}
 
-	return val, ok
+	return "", false
 }
 
 func (e *Engine) Put(key, value string) {
 	slog.Info("Put called", "key", key, "value", value)
+
+	entry, err := newWALEntry(key, value, entryTypePut)
+	if err != nil {
+		slog.Error("Failed to create WAL entry", "key", key, "error", err)
+		return
+	}
+	if err := e.wal.append(entry); err != nil {
+		slog.Error("Failed to append WAL entry", "key", key, "error", err)
+		return
+	}
 
 	e.memTable.put(key, value)
 
@@ -67,6 +87,15 @@ func (e *Engine) Put(key, value string) {
 func (e *Engine) Delete(key string) {
 	slog.Info("Delete called", "key", key)
 
-	// Add a tombstone
-	e.memTable.put(key, "")
+	entry, err := newWALEntry(key, "", entryTypeDelete)
+	if err != nil {
+		slog.Error("Failed to create WAL entry", "key", key, "error", err)
+		return
+	}
+	if err := e.wal.append(entry); err != nil {
+		slog.Error("Failed to append WAL entry", "key", key, "error", err)
+		return
+	}
+
+	e.memTable.delete(key)
 }

@@ -10,6 +10,7 @@ const (
 
 	walFileName   = "wal.db"
 	ssTablePrefix = "sst-"
+	ssTableExt    = ".db"
 )
 
 func rootDirPath() string {

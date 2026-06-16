@@ -18,8 +18,9 @@ const (
 
 // ssTableEntry represents a key-value pair in the table
 type ssTableEntry struct {
-	K string `json:"k"`
-	V string `json:"v"`
+	K    string    `json:"k"`
+	V    string    `json:"v"`
+	Type entryType `json:"type"`
 }
 
 type ssTable struct {
@@ -29,7 +30,7 @@ type ssTable struct {
 	manifestPath string
 }
 
-func NewSSTable(dir string) *ssTable {
+func newSSTable(dir string) *ssTable {
 	tables, count, err := getAllSSTables(dir)
 
 	if err != nil {
@@ -73,7 +74,7 @@ func getAllSSTables(dir string) ([]string, int, error) {
 	if lastLine != "" {
 		parts := strings.Split(lastLine, "-")
 		if len(parts) >= 2 {
-			numPart := strings.TrimSuffix(parts[1], ".txt")
+			numPart := strings.TrimSuffix(parts[1], ssTableExt)
 			_, err := fmt.Sscanf(numPart, "%d", &counter)
 			if err != nil {
 				counter = 0
@@ -88,10 +89,10 @@ func getAllSSTables(dir string) ([]string, int, error) {
 
 func (sst *ssTable) getSSTableName() string {
 	sst.counter++
-	return fmt.Sprintf("%s%d.txt", ssTablePrefix, sst.counter)
+	return fmt.Sprintf("%s%d%s", ssTablePrefix, sst.counter, ssTableExt)
 }
 
-func (sst *ssTable) saveSSTable(m map[string]string) error {
+func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 	slog.Info("SaveSSTable called")
 	fileName := sst.getSSTableName()
 
@@ -127,7 +128,7 @@ func (sst *ssTable) saveSSTable(m map[string]string) error {
 
 	for _, k := range keys {
 		v := m[k]
-		entry := ssTableEntry{K: k, V: m[k]}
+		entry := ssTableEntry{K: k, V: v.Value, Type: v.Type}
 		line, err := json.Marshal(entry)
 		if err != nil {
 			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
@@ -137,7 +138,7 @@ func (sst *ssTable) saveSSTable(m map[string]string) error {
 			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
 			return err
 		}
-		slog.Debug("Added entry to SSTable", "key", k, "value", v)
+		slog.Debug("Added entry to SSTable", "key", k, "value", v.Value, "type", v.Type)
 	}
 	slog.Info("SSTable file written in JSON Lines format", "file", filePath)
 
@@ -161,7 +162,7 @@ func (sst *ssTable) saveSSTable(m map[string]string) error {
 	return nil
 }
 
-func (sst *ssTable) getKey(key string) (string, bool) {
+func (sst *ssTable) getKey(key string) (storageEntry, bool) {
 	for _, v := range sst.tables {
 		f, err := os.Open(filepath.Join(sst.dir, v))
 		if err != nil {
@@ -186,7 +187,14 @@ func (sst *ssTable) getKey(key string) (string, bool) {
 			}
 
 			if key == entry.K {
-				return entry.V, true
+				if entry.Type == "" {
+					entry.Type = entryTypePut
+				}
+
+				return storageEntry{
+					Type:  entry.Type,
+					Value: entry.V,
+				}, true
 			}
 		}
 
@@ -194,5 +202,5 @@ func (sst *ssTable) getKey(key string) (string, bool) {
 			log.Fatalf("error during reading sstable: %s", err)
 		}
 	}
-	return "", false
+	return storageEntry{}, false
 }
