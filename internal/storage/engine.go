@@ -18,11 +18,32 @@ type Engine struct {
 func NewEngine() *Engine {
 	slog.Info("Creating new Engine instance")
 
-	return &Engine{
+	e := &Engine{
 		memTable: newMemTable(),
 		wal:      newWAL(walDirPath()),
 		ssTable:  newSSTable(sstableDirPath()),
 	}
+
+	//load the wal into memory
+	entries, err := e.wal.getAll()
+
+	if err != nil {
+		slog.Info("Error while loading the WAL", "err", err)
+	}
+
+	slog.Info("Processing wal entries", "Count", len(entries))
+	for _, v := range entries {
+		switch v.Type {
+		case entryTypeDelete:
+			e.memTable.delete(v.Key)
+		case entryTypePut:
+			e.memTable.put(v.Key, v.Value)
+		default:
+			slog.Info("Unknow entry in wal", "type", v.Type)
+		}
+	}
+
+	return e
 }
 
 func (e *Engine) Get(key string) (string, bool) {
@@ -79,6 +100,11 @@ func (e *Engine) Put(key, value string) {
 			slog.Info("SaveSSTable succeeded, clearing in-memory map")
 		}
 		clear(e.memTable.kv)
+		if err := e.wal.clear(); err != nil {
+			//TODO stop server (recovery)?
+			slog.Error("Error while deleting the wal file", "error", err)
+			return
+		}
 	}
 
 	slog.Info("Key inserted/updated", "key", key)

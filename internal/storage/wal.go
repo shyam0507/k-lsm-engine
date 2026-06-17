@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
@@ -83,4 +84,69 @@ func (w *wal) append(e *walEntry) error {
 	}
 
 	return nil
+}
+
+func (w *wal) clear() error {
+	err := os.Remove(w.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
+		return err
+	}
+	return nil
+}
+
+func (w *wal) getAll() ([]walPayload, error) {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDONLY, 0644)
+	if err != nil {
+		slog.Error("Failed to open WAL file for reading", "file", w.path, "error", err)
+		return nil, err
+	}
+	defer f.Close()
+
+	entries := make([]walPayload, 0, 100)
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		b := scanner.Bytes()
+
+		var walEnt walEntry
+		err := json.Unmarshal(b, &walEnt)
+		if err != nil {
+			slog.Error("Error while unmarshalling wal entry", "err", err)
+			return entries, err
+		}
+
+		//Check the crc
+		walPay := walPayload{
+			Key:   walEnt.Key,
+			Value: walEnt.Value,
+			Type:  walEnt.Type,
+		}
+
+		crc, err := calculateCRC(walPay)
+		if err != nil {
+			slog.Error("Error while calculating the CRC", "err", err)
+			return entries, err
+		}
+
+		if crc != walEnt.CRC {
+			err := fmt.Errorf("calculated crc %s and stored crc %s do not match", crc, walEnt.CRC)
+			slog.Error("calculated crc and stored crc does not match", "err", err)
+			return entries, err
+		}
+
+		entries = append(entries, walPay)
+
+	}
+
+	if err := scanner.Err(); err != nil {
+		slog.Error("Error while getting data from wal", "err", err)
+		return entries, err
+	}
+
+	return entries, nil
+
 }
