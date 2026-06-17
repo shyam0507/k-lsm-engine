@@ -95,6 +95,7 @@ func (w *wal) clear() error {
 		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
 		return err
 	}
+	slog.Info("WAL cleared")
 	return nil
 }
 

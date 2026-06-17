@@ -51,6 +51,7 @@ func main() {
 
 	flush := func() { wg.Wait() }
 
+	start := time.Now()
 	currKind := "" // "", "PUT", "GET", "DELETE"
 	for _, st := range steps {
 		if st.kind == "BARRIER" {
@@ -95,6 +96,7 @@ func main() {
 		}
 	}
 	flush()
+	fmt.Printf("total time taken: %s\n", time.Since(start))
 }
 
 type step struct {
