@@ -7,7 +7,7 @@ import (
 
 // TODO expose the value via env
 const (
-	FLUSH_THRESHOLD = 2
+	FLUSH_THRESHOLD = 10000
 )
 
 type Engine struct {
@@ -137,7 +137,7 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 		return
 	}
 
-	if err := e.wal.clear(); err != nil {
+	if err := e.wal.truncate(); err != nil {
 		//TODO stop server (recovery)?
 		slog.Error("Error while deleting the wal file", "error", err)
 		return
