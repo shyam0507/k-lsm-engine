@@ -83,11 +83,16 @@ func (w *wal) append(e *walEntry) error {
 		return err
 	}
 
+	if err := f.Sync(); err != nil {
+		slog.Error("Failed to fsync the wal", "error", err)
+		return err
+	}
+
 	return nil
 }
 
-func (w *wal) clear() error {
-	err := os.Remove(w.path)
+func (w *wal) truncate() error {
+	f, err := os.OpenFile(w.path, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -95,7 +100,13 @@ func (w *wal) clear() error {
 		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
 		return err
 	}
-	slog.Info("WAL cleared")
+	defer f.Close()
+
+	if err := f.Sync(); err != nil {
+		slog.Error("Failed to fsync the wal on truncate", "error", err)
+		return err
+	}
+
 	return nil
 }
 
