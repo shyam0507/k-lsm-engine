@@ -2,6 +2,7 @@ package storage
 
 import (
 	"log/slog"
+	"maps"
 	"sync"
 )
 
@@ -57,7 +58,10 @@ func (mem *memTable) getAll() map[string]storageEntry {
 	slog.Info("memTable getAll called")
 	mem.mu.RLock()
 	defer mem.mu.RUnlock()
-	return mem.kv
+
+	result := make(map[string]storageEntry)
+	maps.Copy(result, mem.kv)
+	return result
 }
 
 func (mem *memTable) size() int {

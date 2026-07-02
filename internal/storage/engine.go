@@ -5,7 +5,6 @@ import (
 	"sync"
 )
 
-// TODO expose the value via env
 const (
 	FLUSH_THRESHOLD = 10000
 )

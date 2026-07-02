@@ -75,16 +75,27 @@ func (w *wal) append(e *walEntry) error {
 		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
 		return err
 	}
-	defer f.Close()
 
 	err = json.NewEncoder(f).Encode(e)
 	if err != nil {
+		f.Close()
 		slog.Error("Failed to write entry to WAL", "file", w.path, "error", err)
 		return err
 	}
 
 	if err := f.Sync(); err != nil {
+		f.Close()
 		slog.Error("Failed to fsync the wal", "error", err)
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		slog.Error("Failed to close WAL file after write", "file", w.path, "error", err)
+		return err
+	}
+
+	if err := syncParentDir(w.path); err != nil {
+		slog.Error("Failed to fsync WAL parent directory", "dir", filepath.Dir(w.path), "error", err)
 		return err
 	}
 
@@ -100,12 +111,19 @@ func (w *wal) truncate() error {
 		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
 		return err
 	}
-	defer f.Close()
 
 	if err := f.Sync(); err != nil {
+		f.Close()
 		slog.Error("Failed to fsync the wal on truncate", "error", err)
 		return err
 	}
+
+	if err := f.Close(); err != nil {
+		slog.Error("Failed to close WAL file after truncate", "file", w.path, "error", err)
+		return err
+	}
+
+	// truncation does not change directory entries, so no dir sync required.
 
 	return nil
 }

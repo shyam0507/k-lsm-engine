@@ -94,15 +94,9 @@ func (sst *ssTable) getSSTableName() string {
 
 func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 	slog.Info("SaveSSTable called")
-	fileName := sst.getSSTableName()
+	sstFileName := sst.getSSTableName()
+	filePath := filepath.Join(sst.dir, sstFileName)
 
-	filePath := filepath.Join(sst.dir, fileName)
-	absFilePath, absErr := filepath.Abs(filePath)
-	if absErr != nil {
-		slog.Error("Failed to get absolute file path", "file", filePath, "error", absErr)
-	} else {
-		slog.Info("Absolute table file path", "absFilePath", absFilePath)
-	}
 	// Ensure the sstable directory exists
 	dirPath := filepath.Dir(filePath)
 	err := os.MkdirAll(dirPath, 0755)
@@ -116,7 +110,6 @@ func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
 		return err
 	}
-	defer f.Close()
 
 	//sort keys before storing
 	keys := make([]string, 0, len(m))
@@ -132,32 +125,70 @@ func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 		line, err := json.Marshal(entry)
 		if err != nil {
 			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
-			return err
+			continue
 		}
 		if _, err := f.Write(append(line, '\n')); err != nil {
 			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
-			return err
+			continue
 		}
 		slog.Debug("Added entry to SSTable", "key", k, "value", v.Value, "type", v.Type)
 	}
-	slog.Info("SSTable file written in JSON Lines format", "file", filePath)
 
-	// now append the name to manifest file
+	//fsync the file
+	if err := f.Sync(); err != nil {
+		f.Close()
+		slog.Error("Failed to fsync the sstable", "error", err)
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		slog.Error("Failed to close new sstable file after write", "file", filePath, "error", err)
+		return err
+	}
+
+	//fysnc the dir
+	if err := syncParentDir(filePath); err != nil {
+		slog.Error("Failed to fsync the sstable dir", "error", err)
+		return err
+	}
+	slog.Info("SSTable file written in JSON Lines format and dir synched", "file", filePath)
+
+	/*
+		Now modify the manifest file
+	*/
+
 	mf, err := os.OpenFile(sst.manifestPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		slog.Error("Failed to open manifest file", "file", sst.manifestPath, "error", err)
 		return err
 	}
-	defer mf.Close()
 
-	if _, err := mf.WriteString(fileName + "\n"); err != nil {
+	if _, err := mf.WriteString(sstFileName + "\n"); err != nil {
+		mf.Close()
 		slog.Error("Failed to write to manifest file", "file", sst.manifestPath, "error", err)
 		return err
 	}
-	slog.Info("SSTable written to disk with name", "name", fileName)
+
+	if err := mf.Sync(); err != nil {
+		mf.Close()
+		slog.Error("Failed to fsync the manifest file", "error", err)
+		return err
+	}
+
+	if err := mf.Close(); err != nil {
+		slog.Error("Failed to close new manifest file after write", "file", sst.manifestPath, "error", err)
+		return err
+	}
+
+	//fysnc the manifest dir
+	if err := syncParentDir(sst.manifestPath); err != nil {
+		slog.Error("Failed to fsync the sstable dir", "error", err)
+		return err
+	}
+	slog.Info("SSTable written to disk with name", "name", sstFileName)
 
 	//add the entry to the table
-	sst.tables = append([]string{fileName}, sst.tables...)
+	sst.tables = append([]string{sstFileName}, sst.tables...)
 
 	return nil
 }
@@ -191,6 +222,7 @@ func (sst *ssTable) getKey(key string) (storageEntry, bool) {
 					entry.Type = entryTypePut
 				}
 
+				f.Close()
 				return storageEntry{
 					Type:  entry.Type,
 					Value: entry.V,
@@ -201,6 +233,8 @@ func (sst *ssTable) getKey(key string) (storageEntry, bool) {
 		if err := scanner.Err(); err != nil {
 			log.Fatalf("error during reading sstable: %s", err)
 		}
+
+		f.Close()
 	}
 	return storageEntry{}, false
 }
