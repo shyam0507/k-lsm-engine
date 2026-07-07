@@ -6,7 +6,8 @@ import (
 )
 
 const (
-	FLUSH_THRESHOLD = 10000
+	FLUSH_THRESHOLD      = 2000
+	COMPACTION_THRESHOLD = 5 //compact when number of tables are met
 )
 
 type Engine struct {
@@ -144,4 +145,17 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 
 	e.memTable.clear()
 	slog.Info("SaveSSTable succeeded, clearing in-memory map")
+
+	e.maybeCompactIfNeeded()
+}
+
+func (e *Engine) maybeCompactIfNeeded() {
+	if len(e.ssTable.tables) < COMPACTION_THRESHOLD {
+		return
+	}
+
+	slog.Info("Compaction threshold reached, starting SSTable compaction", "count", len(e.ssTable.tables))
+	if err := e.ssTable.compactSSTables(); err != nil {
+		slog.Error("SSTable compaction failed", "error", err)
+	}
 }

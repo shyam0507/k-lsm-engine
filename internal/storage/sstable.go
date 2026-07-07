@@ -105,52 +105,11 @@ func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 		return err
 	}
 
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
+	if err := sst.writeSSTableFile(filePath, m); err != nil {
+		slog.Error("Failed to write SSTable file", "file", filePath, "error", err)
 		return err
 	}
 
-	//sort keys before storing
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-
-	slices.Sort(keys)
-
-	for _, k := range keys {
-		v := m[k]
-		entry := ssTableEntry{K: k, V: v.Value, Type: v.Type}
-		line, err := json.Marshal(entry)
-		if err != nil {
-			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
-			continue
-		}
-		if _, err := f.Write(append(line, '\n')); err != nil {
-			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
-			continue
-		}
-		slog.Debug("Added entry to SSTable", "key", k, "value", v.Value, "type", v.Type)
-	}
-
-	//fsync the file
-	if err := f.Sync(); err != nil {
-		f.Close()
-		slog.Error("Failed to fsync the sstable", "error", err)
-		return err
-	}
-
-	if err := f.Close(); err != nil {
-		slog.Error("Failed to close new sstable file after write", "file", filePath, "error", err)
-		return err
-	}
-
-	//fysnc the dir
-	if err := syncParentDir(filePath); err != nil {
-		slog.Error("Failed to fsync the sstable dir", "error", err)
-		return err
-	}
 	slog.Info("SSTable file written in JSON Lines format and dir synched", "file", filePath)
 
 	/*
@@ -189,6 +148,86 @@ func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 
 	//add the entry to the table
 	sst.tables = append([]string{sstFileName}, sst.tables...)
+
+	return nil
+}
+
+func (sst *ssTable) writeSSTableFile(filePath string, m map[string]storageEntry) error {
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
+		return err
+	}
+
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	for _, k := range keys {
+		v := m[k]
+		entry := ssTableEntry{K: k, V: v.Value, Type: v.Type}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
+			continue
+		}
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
+			continue
+		}
+	}
+
+	if err := f.Sync(); err != nil {
+		f.Close()
+		slog.Error("Failed to fsync the sstable", "error", err)
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		slog.Error("Failed to close new sstable file after write", "file", filePath, "error", err)
+		return err
+	}
+
+	if err := syncParentDir(filePath); err != nil {
+		slog.Error("Failed to fsync the sstable dir", "error", err)
+		return err
+	}
+
+	return nil
+}
+
+func (sst *ssTable) rewriteManifest(tables []string) error {
+	mf, err := os.OpenFile(sst.manifestPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		slog.Error("Failed to open manifest file for rewrite", "file", sst.manifestPath, "error", err)
+		return err
+	}
+
+	for _, table := range tables {
+		if _, err := mf.WriteString(table + "\n"); err != nil {
+			mf.Close()
+			slog.Error("Failed to write to manifest file", "file", sst.manifestPath, "error", err)
+			return err
+		}
+	}
+
+	if err := mf.Sync(); err != nil {
+		mf.Close()
+		slog.Error("Failed to fsync the manifest file", "error", err)
+		return err
+	}
+
+	if err := mf.Close(); err != nil {
+		slog.Error("Failed to close manifest file after rewrite", "file", sst.manifestPath, "error", err)
+		return err
+	}
+
+	if err := syncParentDir(sst.manifestPath); err != nil {
+		slog.Error("Failed to fsync the manifest dir", "error", err)
+		return err
+	}
 
 	return nil
 }
