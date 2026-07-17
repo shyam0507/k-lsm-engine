@@ -10,6 +10,8 @@ import (
 	"strings"
 )
 
+
+
 type sstableReader struct {
 	file    *os.File
 	scanner *bufio.Scanner
@@ -63,6 +65,7 @@ type sstableHeapItem struct {
 	key        string
 	entry      storageEntry
 	tableIndex int
+	level      int // stores the level of the table in lsm tree
 }
 
 type sstableHeap []sstableHeapItem
@@ -72,7 +75,13 @@ func (h sstableHeap) Less(i, j int) bool {
 	if h[i].key != h[j].key {
 		return h[i].key < h[j].key
 	}
-	return h[i].tableIndex < h[j].tableIndex
+
+	if h[i].level == h[j].level {
+		return h[i].tableIndex < h[j].tableIndex
+	}
+
+	return h[i].level < h[j].level
+
 }
 func (h sstableHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *sstableHeap) Push(x any)   { *h = append(*h, x.(sstableHeapItem)) }
@@ -84,7 +93,7 @@ func (h *sstableHeap) Pop() any {
 	return item
 }
 
-func (sst *ssTable) compactSSTables() error {
+func (sst *sstableStore) compactSSTables() error {
 	if len(sst.tables) < 2 {
 		return nil
 	}
@@ -113,6 +122,7 @@ func (sst *ssTable) compactSSTables() error {
 				key:        r.entry.K,
 				entry:      storageEntry{Type: r.entry.Type, Value: r.entry.V},
 				tableIndex: i,
+				level: table
 			})
 		}
 	}
@@ -213,3 +223,6 @@ func (sst *ssTable) compactSSTables() error {
 	slog.Info("SSTable compaction completed", "new_tables", len(newTables), "merged_entries", len(newTables)*FLUSH_THRESHOLD)
 	return nil
 }
+
+
+

@@ -8,12 +8,13 @@ import (
 const (
 	FLUSH_THRESHOLD      = 2000
 	COMPACTION_THRESHOLD = 5 //compact when number of tables are met
+	MAX_LEVELS           = 2
 )
 
 type Engine struct {
 	memTable *memTable
 	wal      *wal
-	ssTable  *ssTable
+	ssTable  *sstableStore
 
 	writeMu sync.Mutex
 }

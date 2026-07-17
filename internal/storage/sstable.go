@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -23,21 +24,27 @@ type ssTableEntry struct {
 	Type entryType `json:"type"`
 }
 
-type ssTable struct {
+// for identifying sstable name and level
+type ssTableItem struct {
+	name  string
+	level int
+}
+
+type sstableStore struct {
 	tables       []string
 	counter      int //for the sstable name
 	dir          string
 	manifestPath string
 }
 
-func newSSTable(dir string) *ssTable {
-	tables, count, err := getAllSSTables(dir)
+func newSSTable(dir string) *sstableStore {
+	tables, count, err := getLevel0SSTables(dir)
 
 	if err != nil {
 		log.Fatal("Error while parsing/loading sstable", err)
 	}
 
-	return &ssTable{
+	return &sstableStore{
 		tables:       tables,
 		counter:      count,
 		dir:          dir,
@@ -45,34 +52,18 @@ func newSSTable(dir string) *ssTable {
 	}
 }
 
-// getAllSSTables reads the manifest file from the SSTable directory and returns
-// loaded table names in reverse order plus the current counter.
-func getAllSSTables(dir string) ([]string, int, error) {
-	tables := make([]string, 0)
+// getLevel0SSTables reads the manifest file from the SSTable directory and returns
+// level 0 loaded table names in reverse order plus the current counter.
+func getLevel0SSTables(dir string) ([]string, int, error) {
 	counter := 0
-
-	f, err := os.Open(filepath.Join(dir, MANIFEST_FILE_NAME))
+	tables, err := getAllSSTables(dir, 0)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return tables, counter, nil
-		}
-		return tables, counter, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	var lastLine string
-	for scanner.Scan() {
-		lastLine = scanner.Text()
-		tables = append(tables, lastLine)
-	}
-	if err := scanner.Err(); err != nil {
-		slog.Error("Error while getting data", "err", err)
-		return tables, counter, err
+		slog.Error("Error while getting level 0 ss tables", "err", err)
+		return nil, counter, err
 	}
 
-	if lastLine != "" {
-		parts := strings.Split(lastLine, "-")
+	if len(tables) > 0 {
+		parts := strings.Split(tables[len(tables)-1].name, "-")
 		if len(parts) >= 2 {
 			numPart := strings.TrimSuffix(parts[1], ssTableExt)
 			_, err := fmt.Sscanf(numPart, "%d", &counter)
@@ -82,17 +73,64 @@ func getAllSSTables(dir string) ([]string, int, error) {
 		}
 	}
 
+	tableArray := make([]string, len(tables))
+	for i, v := range tables {
+		tableArray[i] = v.name
+	}
+
 	//Reverse the table because the latest information will be in latest table
-	slices.Reverse(tables)
-	return tables, counter, nil
+	slices.Reverse(tableArray)
+	return tableArray, counter, nil
 }
 
-func (sst *ssTable) getSSTableName() string {
+// getAllSSTables reads the manifest file from the SSTable directory and returns
+// loaded table names in reverse order plus the current counter.
+func getAllSSTables(dir string, upToLevel int) ([]ssTableItem, error) {
+	tables := make([]ssTableItem, 0)
+
+	f, err := os.Open(filepath.Join(dir, MANIFEST_FILE_NAME))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return tables, nil
+		}
+		return tables, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var lastLine string
+	currentLevel := -1
+	for scanner.Scan() {
+		lastLine = scanner.Text()
+		levelSep, err := regexp.MatchString(`^\[L[0-9]+\]$`, lastLine)
+		if err != nil {
+			slog.Error("Error while scanning manifest file", "err", err)
+			return tables, err
+		}
+		if levelSep {
+			currentLevel++
+		}
+
+		//if level matched break out of loop
+		if currentLevel > upToLevel {
+			break
+		}
+		tables = append(tables, ssTableItem{name: lastLine, level: currentLevel})
+	}
+	if err := scanner.Err(); err != nil {
+		slog.Error("Error while getting data", "err", err)
+		return tables, err
+	}
+
+	return tables, nil
+}
+
+func (sst *sstableStore) getSSTableName() string {
 	sst.counter++
 	return fmt.Sprintf("%s%d%s", ssTablePrefix, sst.counter, ssTableExt)
 }
 
-func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
+func (sst *sstableStore) saveSSTable(m map[string]storageEntry) error {
 	slog.Info("SaveSSTable called")
 	sstFileName := sst.getSSTableName()
 	filePath := filepath.Join(sst.dir, sstFileName)
@@ -152,7 +190,7 @@ func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 	return nil
 }
 
-func (sst *ssTable) writeSSTableFile(filePath string, m map[string]storageEntry) error {
+func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageEntry) error {
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
@@ -198,7 +236,7 @@ func (sst *ssTable) writeSSTableFile(filePath string, m map[string]storageEntry)
 	return nil
 }
 
-func (sst *ssTable) rewriteManifest(tables []string) error {
+func (sst *sstableStore) rewriteManifest(tables []string) error {
 	mf, err := os.OpenFile(sst.manifestPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		slog.Error("Failed to open manifest file for rewrite", "file", sst.manifestPath, "error", err)
@@ -232,7 +270,7 @@ func (sst *ssTable) rewriteManifest(tables []string) error {
 	return nil
 }
 
-func (sst *ssTable) getKey(key string) (storageEntry, bool) {
+func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 	for _, v := range sst.tables {
 		f, err := os.Open(filepath.Join(sst.dir, v))
 		if err != nil {
