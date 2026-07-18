@@ -12,9 +12,9 @@ const (
 )
 
 type Engine struct {
-	memTable *memTable
-	wal      *wal
-	ssTable  *sstableStore
+	memTable     *memTable
+	wal          *wal
+	ssTableStore *sstableStore
 
 	writeMu sync.Mutex
 }
@@ -23,10 +23,10 @@ func NewEngine() *Engine {
 	slog.Info("Creating new Engine instance")
 
 	e := &Engine{
-		memTable: newMemTable(),
-		wal:      newWAL(walDirPath()),
-		ssTable:  newSSTable(sstableDirPath()),
-		writeMu:  sync.Mutex{},
+		memTable:     newMemTable(),
+		wal:          newWAL(walDirPath()),
+		ssTableStore: newSSTableStore(sstableDirPath()),
+		writeMu:      sync.Mutex{},
 	}
 
 	//load the wal into memory
@@ -67,7 +67,7 @@ func (e *Engine) Get(key string) (string, bool) {
 	}
 
 	// Get data from sstable
-	entry, ok = e.ssTable.getKey(key)
+	entry, ok = e.ssTableStore.getKey(key)
 	if ok {
 		if entry.Type == entryTypeDelete {
 			slog.Info("Key deleted in ss table", "key", key)
@@ -132,7 +132,7 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 	}
 
 	slog.Info("Flush threshold reached, calling SaveSSTable", "count", count)
-	err := e.ssTable.saveSSTable(e.memTable.getAll())
+	err := e.ssTableStore.saveSSTable(e.memTable.getAll())
 	if err != nil {
 		slog.Error("SaveSSTable failed", "error", err)
 		return
@@ -151,12 +151,12 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 }
 
 func (e *Engine) maybeCompactIfNeeded() {
-	if len(e.ssTable.tables) < COMPACTION_THRESHOLD {
+	if len(e.ssTableStore.getLevelSSTables(0)) < COMPACTION_THRESHOLD {
 		return
 	}
 
-	slog.Info("Compaction threshold reached, starting SSTable compaction", "count", len(e.ssTable.tables))
-	if err := e.ssTable.compactSSTables(); err != nil {
+	slog.Info("Compaction threshold reached, starting SSTable compaction", "count", len(e.ssTableStore.tables))
+	if err := e.ssTableStore.compactSSTables(); err != nil {
 		slog.Error("SSTable compaction failed", "error", err)
 	}
 }

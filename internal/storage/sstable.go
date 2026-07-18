@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strings"
 )
 
 const (
@@ -24,115 +23,105 @@ type ssTableEntry struct {
 	Type entryType `json:"type"`
 }
 
-// for identifying sstable name and level
-type ssTableItem struct {
-	name  string
-	level int
+type sstableLevel struct {
+	tables []string
+	level  int
 }
-
 type sstableStore struct {
-	tables       []string
-	counter      int //for the sstable name
 	dir          string
 	manifestPath string
+	levels       []sstableLevel
 }
 
-func newSSTable(dir string) *sstableStore {
-	tables, count, err := getLevel0SSTables(dir)
+func newSSTableStore(dir string) *sstableStore {
+	levels, err := getAllSSTables(dir, MAX_LEVELS)
 
 	if err != nil {
 		log.Fatal("Error while parsing/loading sstable", err)
 	}
 
 	return &sstableStore{
-		tables:       tables,
-		counter:      count,
+		levels:       levels,
 		dir:          dir,
 		manifestPath: filepath.Join(dir, MANIFEST_FILE_NAME),
 	}
 }
 
-// getLevel0SSTables reads the manifest file from the SSTable directory and returns
-// level 0 loaded table names in reverse order plus the current counter.
-func getLevel0SSTables(dir string) ([]string, int, error) {
-	counter := 0
-	tables, err := getAllSSTables(dir, 0)
-	if err != nil {
-		slog.Error("Error while getting level 0 ss tables", "err", err)
-		return nil, counter, err
-	}
-
-	if len(tables) > 0 {
-		parts := strings.Split(tables[len(tables)-1].name, "-")
-		if len(parts) >= 2 {
-			numPart := strings.TrimSuffix(parts[1], ssTableExt)
-			_, err := fmt.Sscanf(numPart, "%d", &counter)
-			if err != nil {
-				counter = 0
-			}
+// return the sstable slice of a level
+func (sst *sstableStore) getLevelSSTables(level int) []string {
+	for _, v := range sst.levels {
+		if v.level == level {
+			return v.tables
 		}
 	}
-
-	tableArray := make([]string, len(tables))
-	for i, v := range tables {
-		tableArray[i] = v.name
-	}
-
-	//Reverse the table because the latest information will be in latest table
-	slices.Reverse(tableArray)
-	return tableArray, counter, nil
+	return nil
 }
 
 // getAllSSTables reads the manifest file from the SSTable directory and returns
 // loaded table names in reverse order plus the current counter.
-func getAllSSTables(dir string, upToLevel int) ([]ssTableItem, error) {
-	tables := make([]ssTableItem, 0)
+func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
+	levels := make([]sstableLevel, 0)
 
 	f, err := os.Open(filepath.Join(dir, MANIFEST_FILE_NAME))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return tables, nil
+			return levels, nil
 		}
-		return tables, err
+		return levels, err
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	var lastLine string
 	currentLevel := -1
+
+	var tables []string
 	for scanner.Scan() {
 		lastLine = scanner.Text()
 		levelSep, err := regexp.MatchString(`^\[L[0-9]+\]$`, lastLine)
 		if err != nil {
 			slog.Error("Error while scanning manifest file", "err", err)
-			return tables, err
+			return levels, err
 		}
 		if levelSep {
+			if currentLevel >= 0 {
+				levels = append(levels, sstableLevel{
+					tables: tables,
+					level:  currentLevel,
+				})
+			}
 			currentLevel++
+			//clear the tables array
+			tables = nil
 		}
 
 		//if level matched break out of loop
 		if currentLevel > upToLevel {
 			break
 		}
-		tables = append(tables, ssTableItem{name: lastLine, level: currentLevel})
+		tables = append(tables, lastLine)
 	}
 	if err := scanner.Err(); err != nil {
 		slog.Error("Error while getting data", "err", err)
-		return tables, err
+		return levels, err
 	}
 
-	return tables, nil
+	return levels, nil
 }
 
-func (sst *sstableStore) getSSTableName() string {
-	sst.counter++
-	return fmt.Sprintf("%s%d%s", ssTablePrefix, sst.counter, ssTableExt)
+func (sst *sstableStore) getSSTableName(level int) string {
+	var count int
+	for _, v := range sst.levels {
+		if v.level == level {
+			count = 1 + len(v.tables)
+		}
+	}
+	return fmt.Sprintf("%s%d%s", ssTablePrefix, count, ssTableExt)
 }
 
 func (sst *sstableStore) saveSSTable(m map[string]storageEntry) error {
 	slog.Info("SaveSSTable called")
-	sstFileName := sst.getSSTableName()
+	sstFileName := sst.getSSTableName(0)
 	filePath := filepath.Join(sst.dir, sstFileName)
 
 	// Ensure the sstable directory exists
@@ -185,8 +174,12 @@ func (sst *sstableStore) saveSSTable(m map[string]storageEntry) error {
 	slog.Info("SSTable written to disk with name", "name", sstFileName)
 
 	//add the entry to the table
-	sst.tables = append([]string{sstFileName}, sst.tables...)
-
+	var level = 0
+	for _, v := range sst.levels {
+		if v.level == level {
+			v.tables = append(v.tables, sstFileName)
+		}
+	}
 	return nil
 }
 
@@ -271,7 +264,7 @@ func (sst *sstableStore) rewriteManifest(tables []string) error {
 }
 
 func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
-	for _, v := range sst.tables {
+	for _, v := range sst.getLevelSSTables(0) {
 		f, err := os.Open(filepath.Join(sst.dir, v))
 		if err != nil {
 			slog.Error("Error while reading the ss table")

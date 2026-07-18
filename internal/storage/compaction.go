@@ -10,8 +10,6 @@ import (
 	"strings"
 )
 
-
-
 type sstableReader struct {
 	file    *os.File
 	scanner *bufio.Scanner
@@ -93,37 +91,40 @@ func (h *sstableHeap) Pop() any {
 	return item
 }
 
+// by default compact level 0 and level 1
 func (sst *sstableStore) compactSSTables() error {
-	if len(sst.tables) < 2 {
+	if len(sst.getLevelSSTables(0)) < 2 {
 		return nil
 	}
 
-	readers := make([]*sstableReader, len(sst.tables))
+	readers := make([]*sstableReader, len(sst.getLevelSSTables(0)))
 	h := &sstableHeap{}
-
-	for i, table := range sst.tables {
-		r, err := newSSTableReader(filepath.Join(sst.dir, table))
-		if err != nil {
-			return err
-		}
-		readers[i] = r
-
-		if err := r.advance(); err != nil {
-			for j := 0; j <= i; j++ {
-				if readers[j] != nil {
-					readers[j].close()
-				}
+	for _, level := range sst.levels {
+		for i, table := range level.tables {
+			//TODO change to read filepath based upon the dir
+			r, err := newSSTableReader(filepath.Join(sst.dir, table))
+			if err != nil {
+				return err
 			}
-			return err
-		}
+			readers[i] = r
 
-		if r.hasNext {
-			heap.Push(h, sstableHeapItem{
-				key:        r.entry.K,
-				entry:      storageEntry{Type: r.entry.Type, Value: r.entry.V},
-				tableIndex: i,
-				level: table
-			})
+			if err := r.advance(); err != nil {
+				for j := 0; j <= i; j++ {
+					if readers[j] != nil {
+						readers[j].close()
+					}
+				}
+				return err
+			}
+
+			if r.hasNext {
+				heap.Push(h, sstableHeapItem{
+					key:        r.entry.K,
+					entry:      storageEntry{Type: r.entry.Type, Value: r.entry.V},
+					tableIndex: i,
+					level:      sst.levels[0].level,
+				})
+			}
 		}
 	}
 
@@ -140,7 +141,7 @@ func (sst *sstableStore) compactSSTables() error {
 			return nil
 		}
 
-		newTableName := sst.getSSTableName()
+		newTableName := sst.getSSTableName(0)
 		newFilePath := filepath.Join(sst.dir, newTableName)
 		if err := sst.writeSSTableFile(newFilePath, chunk); err != nil {
 			return err
@@ -223,6 +224,3 @@ func (sst *sstableStore) compactSSTables() error {
 	slog.Info("SSTable compaction completed", "new_tables", len(newTables), "merged_entries", len(newTables)*FLUSH_THRESHOLD)
 	return nil
 }
-
-
-
