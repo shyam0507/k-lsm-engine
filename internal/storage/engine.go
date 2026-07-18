@@ -132,7 +132,7 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 	}
 
 	slog.Info("Flush threshold reached, calling SaveSSTable", "count", count)
-	err := e.ssTableStore.saveSSTable(e.memTable.getAll())
+	err := e.ssTableStore.saveLevel0SSTable(e.memTable.getAll())
 	if err != nil {
 		slog.Error("SaveSSTable failed", "error", err)
 		return
@@ -155,7 +155,7 @@ func (e *Engine) maybeCompactIfNeeded() {
 		return
 	}
 
-	slog.Info("Compaction threshold reached, starting SSTable compaction", "count", len(e.ssTableStore.tables))
+	slog.Info("Compaction threshold reached, starting SSTable compaction", "count", len(e.ssTableStore.getLevelSSTables(0)))
 	if err := e.ssTableStore.compactSSTables(); err != nil {
 		slog.Error("SSTable compaction failed", "error", err)
 	}

@@ -31,13 +31,13 @@ func TestSSTableTombstoneHidesOlderValue(t *testing.T) {
 	dir := t.TempDir()
 	sst := newSSTableStore(dir)
 
-	if err := sst.saveSSTable(map[string]storageEntry{
+	if err := sst.saveLevel0SSTable(map[string]storageEntry{
 		"key": {Type: entryTypePut, Value: "value"},
 	}); err != nil {
 		t.Fatalf("save put sstable: %v", err)
 	}
 
-	if err := sst.saveSSTable(map[string]storageEntry{
+	if err := sst.saveLevel0SSTable(map[string]storageEntry{
 		"key": {Type: entryTypeDelete},
 	}); err != nil {
 		t.Fatalf("save delete sstable: %v", err)
@@ -77,7 +77,7 @@ func TestPutFlushesMoreThanOnce(t *testing.T) {
 		engine.Put(fmt.Sprintf("key-%d", i), fmt.Sprintf("value-%d", i))
 	}
 
-	if got := len(engine.ssTableStore.tables); got != 2 {
+	if got := len(engine.ssTableStore.getLevelSSTables(0)); got != 2 {
 		t.Fatalf("expected 2 sstables after two flush cycles, got %d", got)
 	}
 	if got := engine.memTable.size(); got != 0 {
@@ -106,7 +106,7 @@ func TestDeleteCanTriggerFlush(t *testing.T) {
 
 	engine.Delete("deleted-key")
 
-	if got := len(engine.ssTableStore.tables); got != 1 {
+	if got := len(engine.ssTableStore.getLevelSSTables(0)); got != 1 {
 		t.Fatalf("expected delete to trigger flush and create 1 sstable, got %d", got)
 	}
 	if got := engine.memTable.size(); got != 0 {

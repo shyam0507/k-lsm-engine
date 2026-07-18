@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"container/heap"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -74,12 +76,11 @@ func (h sstableHeap) Less(i, j int) bool {
 		return h[i].key < h[j].key
 	}
 
-	if h[i].level == h[j].level {
-		return h[i].tableIndex < h[j].tableIndex
+	if h[i].level != h[j].level {
+		return h[i].level < h[j].level
 	}
 
-	return h[i].level < h[j].level
-
+	return h[i].tableIndex > h[j].tableIndex
 }
 func (h sstableHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *sstableHeap) Push(x any)   { *h = append(*h, x.(sstableHeapItem)) }
@@ -92,57 +93,79 @@ func (h *sstableHeap) Pop() any {
 }
 
 // by default compact level 0 and level 1
+// compact and store to level 1
 func (sst *sstableStore) compactSSTables() error {
-	if len(sst.getLevelSSTables(0)) < 2 {
+	l0Tables := sst.getLevelSSTables(0)
+	if len(l0Tables) < 2 {
 		return nil
 	}
 
-	readers := make([]*sstableReader, len(sst.getLevelSSTables(0)))
+	l1Tables := sst.getLevelSSTables(1)
+	readers := make([]*sstableReader, 0, len(l0Tables)+len(l1Tables))
 	h := &sstableHeap{}
-	for _, level := range sst.levels {
-		for i, table := range level.tables {
-			//TODO change to read filepath based upon the dir
-			r, err := newSSTableReader(filepath.Join(sst.dir, table))
-			if err != nil {
-				return err
-			}
-			readers[i] = r
 
-			if err := r.advance(); err != nil {
-				for j := 0; j <= i; j++ {
-					if readers[j] != nil {
-						readers[j].close()
-					}
-				}
-				return err
-			}
-
-			if r.hasNext {
-				heap.Push(h, sstableHeapItem{
-					key:        r.entry.K,
-					entry:      storageEntry{Type: r.entry.Type, Value: r.entry.V},
-					tableIndex: i,
-					level:      sst.levels[0].level,
-				})
+	closeReaders := func() {
+		for _, reader := range readers {
+			if reader != nil {
+				reader.close()
 			}
 		}
 	}
 
+	addTables := func(level int, tables []string) error {
+		for _, table := range tables {
+			r, err := newSSTableReader(filepath.Join(sst.dir, fmt.Sprintf("l%d", level), table))
+			if err != nil {
+				return err
+			}
+
+			if err := r.advance(); err != nil {
+				r.close()
+				return err
+			}
+
+			if !r.hasNext {
+				r.close()
+				continue
+			}
+
+			readers = append(readers, r)
+			heap.Push(h, sstableHeapItem{
+				key:        r.entry.K,
+				entry:      storageEntry{Type: r.entry.Type, Value: r.entry.V},
+				tableIndex: len(readers) - 1,
+				level:      level,
+			})
+		}
+		return nil
+	}
+
+	if err := addTables(0, l0Tables); err != nil {
+		closeReaders()
+		return err
+	}
+	if err := addTables(1, l1Tables); err != nil {
+		closeReaders()
+		return err
+	}
+
 	heap.Init(h)
 
-	var newTables []string
+	newTables := make([]string, 0)
 	chunk := make(map[string]storageEntry, FLUSH_THRESHOLD)
 	chunkCount := 0
 	var currentKey string
 	first := true
 
+	nextL1Index := len(l1Tables) + 1
 	flushChunk := func() error {
 		if chunkCount == 0 {
 			return nil
 		}
 
-		newTableName := sst.getSSTableName(0)
-		newFilePath := filepath.Join(sst.dir, newTableName)
+		newTableName := fmt.Sprintf("%s%d%s", ssTablePrefix, nextL1Index, ssTableExt)
+		nextL1Index++
+		newFilePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", 1), newTableName)
 		if err := sst.writeSSTableFile(newFilePath, chunk); err != nil {
 			return err
 		}
@@ -159,6 +182,7 @@ func (sst *sstableStore) compactSSTables() error {
 		if first || item.key != currentKey {
 			if chunkCount == FLUSH_THRESHOLD {
 				if err := flushChunk(); err != nil {
+					closeReaders()
 					return err
 				}
 			}
@@ -171,11 +195,7 @@ func (sst *sstableStore) compactSSTables() error {
 
 		r := readers[item.tableIndex]
 		if err := r.advance(); err != nil {
-			for _, reader := range readers {
-				if reader != nil {
-					reader.close()
-				}
-			}
+			closeReaders()
 			return err
 		}
 
@@ -184,40 +204,50 @@ func (sst *sstableStore) compactSSTables() error {
 				key:        r.entry.K,
 				entry:      storageEntry{Type: r.entry.Type, Value: r.entry.V},
 				tableIndex: item.tableIndex,
+				level:      item.level,
 			})
 		}
 	}
 
 	if err := flushChunk(); err != nil {
-		for _, reader := range readers {
-			if reader != nil {
-				reader.close()
-			}
-		}
+		closeReaders()
 		return err
 	}
 
-	for _, reader := range readers {
-		if reader != nil {
-			reader.close()
+	closeReaders()
+
+	oldTablesLevel0 := append([]string(nil), l0Tables...)
+	oldTablesLevel1 := append([]string(nil), l1Tables...)
+
+	levels := make([]sstableLevel, 0, len(sst.levels))
+	for _, existing := range sst.levels {
+		if existing.level == 0 || existing.level == 1 {
+			continue
 		}
+		levels = append(levels, existing)
 	}
 
-	oldTables := append([]string(nil), sst.tables...)
+	levels = append(levels, sstableLevel{level: 0, tables: nil})
+	levels = append(levels, sstableLevel{level: 1, tables: newTables})
+	sort.Slice(levels, func(i, j int) bool {
+		return levels[i].level < levels[j].level
+	})
 
-	// Preserve manifest oldest-to-newest ordering, but keep in-memory table list newest-first.
-	sst.tables = make([]string, len(newTables))
-	for i, table := range newTables {
-		sst.tables[len(newTables)-1-i] = table
-	}
-
-	if err := sst.rewriteManifest(newTables); err != nil {
+	if err := sst.rewriteManifestFromLevels(levels); err != nil {
 		return err
 	}
 
-	for _, table := range oldTables {
-		if err := os.Remove(filepath.Join(sst.dir, table)); err != nil && !os.IsNotExist(err) {
-			slog.Error("Failed to remove old SSTable after compaction", "table", table, "error", err)
+	sst.levels = levels
+
+	for _, table := range oldTablesLevel0 {
+		if err := os.Remove(filepath.Join(sst.dir, "l0", table)); err != nil && !os.IsNotExist(err) {
+			slog.Error("Failed to remove old SSTable from level 0 after compaction", "table", table, "error", err)
+		}
+	}
+
+	for _, table := range oldTablesLevel1 {
+		if err := os.Remove(filepath.Join(sst.dir, "l1", table)); err != nil && !os.IsNotExist(err) {
+			slog.Error("Failed to remove old SSTable from level 1 after compaction", "table", table, "error", err)
 		}
 	}
 
