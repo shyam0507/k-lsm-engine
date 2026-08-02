@@ -8,8 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -23,87 +27,177 @@ type ssTableEntry struct {
 	Type entryType `json:"type"`
 }
 
-type ssTable struct {
-	tables       []string
-	counter      int //for the sstable name
+type sstableLevel struct {
+	tables []string
+	level  int
+}
+type sstableStore struct {
 	dir          string
 	manifestPath string
+	levels       []sstableLevel
+	mu           sync.RWMutex
 }
 
-func newSSTable(dir string) *ssTable {
-	tables, count, err := getAllSSTables(dir)
+func newSSTableStore(dir string) *sstableStore {
+	levels, err := getAllSSTables(dir, MAX_LEVELS)
 
 	if err != nil {
 		log.Fatal("Error while parsing/loading sstable", err)
 	}
 
-	return &ssTable{
-		tables:       tables,
-		counter:      count,
+	levels = pruneLevelsFromDisk(dir, levels)
+
+	return &sstableStore{
+		levels:       levels,
 		dir:          dir,
 		manifestPath: filepath.Join(dir, MANIFEST_FILE_NAME),
 	}
 }
 
+func pruneLevelsFromDisk(dir string, levels []sstableLevel) []sstableLevel {
+	pruned := make([]sstableLevel, 0, len(levels))
+	for _, levelEntry := range levels {
+		prunedTables := make([]string, 0, len(levelEntry.tables))
+		for _, table := range levelEntry.tables {
+			tablePath := filepath.Join(dir, fmt.Sprintf("l%d", levelEntry.level), table)
+			_, statErr := os.Stat(tablePath)
+			if statErr == nil {
+				prunedTables = append(prunedTables, table)
+				continue
+			}
+			if !os.IsNotExist(statErr) {
+				slog.Warn("Skipping unreadable SSTable while rebuilding level state", "level", levelEntry.level, "table", table, "path", tablePath, "error", statErr)
+			}
+		}
+		pruned = append(pruned, sstableLevel{level: levelEntry.level, tables: prunedTables})
+	}
+	return pruned
+}
+
+// return the sstable slice of a level
+func (sst *sstableStore) getLevelSSTables(level int) []string {
+	sst.mu.RLock()
+	defer sst.mu.RUnlock()
+	return sst.getLevelSSTablesLocked(level)
+}
+
+func (sst *sstableStore) getLevelSSTablesLocked(level int) []string {
+	for _, v := range sst.levels {
+		if v.level == level {
+			return append([]string(nil), v.tables...)
+		}
+	}
+	return nil
+}
+
 // getAllSSTables reads the manifest file from the SSTable directory and returns
 // loaded table names in reverse order plus the current counter.
-func getAllSSTables(dir string) ([]string, int, error) {
-	tables := make([]string, 0)
-	counter := 0
+func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
+	levels := make([]sstableLevel, 0)
 
 	f, err := os.Open(filepath.Join(dir, MANIFEST_FILE_NAME))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return tables, counter, nil
+			return levels, nil
 		}
-		return tables, counter, err
+		return levels, err
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	var lastLine string
+	var currentLevel = -1
+	var tables []string
+
 	for scanner.Scan() {
-		lastLine = scanner.Text()
-		tables = append(tables, lastLine)
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		switch {
+		case regexp.MustCompile(`^\[L[0-9]+\]$`).MatchString(line):
+			if currentLevel >= 0 {
+				levels = append(levels, sstableLevel{
+					tables: tables,
+					level:  currentLevel,
+				})
+			}
+
+			idx, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSuffix(line, "]"), "[L"))
+			if err != nil {
+				slog.Error("Invalid manifest level header", "line", line, "err", err)
+				return levels, err
+			}
+			currentLevel = idx
+			tables = nil
+			if currentLevel > upToLevel {
+				break
+			}
+		default:
+			if currentLevel < 0 {
+				continue
+			}
+			tables = append(tables, line)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		slog.Error("Error while getting data", "err", err)
-		return tables, counter, err
+		return levels, err
 	}
 
-	if lastLine != "" {
-		parts := strings.Split(lastLine, "-")
-		if len(parts) >= 2 {
-			numPart := strings.TrimSuffix(parts[1], ssTableExt)
-			_, err := fmt.Sscanf(numPart, "%d", &counter)
-			if err != nil {
-				counter = 0
-			}
+	if currentLevel >= 0 {
+		levels = append(levels, sstableLevel{
+			tables: tables,
+			level:  currentLevel,
+		})
+	}
+
+	return levels, nil
+}
+
+func getSSTableIndex(table string) int {
+	if !strings.HasPrefix(table, ssTablePrefix) || !strings.HasSuffix(table, ssTableExt) {
+		return 0
+	}
+
+	numPart := strings.TrimSuffix(strings.TrimPrefix(table, ssTablePrefix), ssTableExt)
+	idx, err := strconv.Atoi(numPart)
+	if err != nil || idx <= 0 {
+		return 0
+	}
+
+	return idx
+}
+
+func getNextSSTableIndex(tables []string) int {
+	maxIdx := 0
+	for _, table := range tables {
+		if idx := getSSTableIndex(table); idx > maxIdx {
+			maxIdx = idx
 		}
 	}
-
-	//Reverse the table because the latest information will be in latest table
-	slices.Reverse(tables)
-	return tables, counter, nil
+	return maxIdx + 1
 }
 
-func (sst *ssTable) getSSTableName() string {
-	sst.counter++
-	return fmt.Sprintf("%s%d%s", ssTablePrefix, sst.counter, ssTableExt)
-}
-
-func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
-	slog.Info("SaveSSTable called")
-	sstFileName := sst.getSSTableName()
-	filePath := filepath.Join(sst.dir, sstFileName)
-
-	// Ensure the sstable directory exists
-	dirPath := filepath.Dir(filePath)
-	err := os.MkdirAll(dirPath, 0755)
-	if err != nil {
-		slog.Error("Failed to create sstable directory", "dir", dirPath, "error", err)
-		return err
+func (sst *sstableStore) getNewSSTableName(level int) string {
+	count := 1
+	for _, v := range sst.levels {
+		if v.level == level {
+			count = getNextSSTableIndex(v.tables)
+			break
+		}
 	}
+	return fmt.Sprintf("%s%d%s", ssTablePrefix, count, ssTableExt)
+}
+
+// saves ss table to level 0
+func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
+	sst.mu.Lock()
+	defer sst.mu.Unlock()
+
+	slog.Info("SaveSSTable called")
+	sstFileName := sst.getNewSSTableName(0)
+	filePath := filepath.Join(sst.dir, "l0", sstFileName)
 
 	if err := sst.writeSSTableFile(filePath, m); err != nil {
 		slog.Error("Failed to write SSTable file", "file", filePath, "error", err)
@@ -115,47 +209,37 @@ func (sst *ssTable) saveSSTable(m map[string]storageEntry) error {
 	/*
 		Now modify the manifest file
 	*/
-
-	mf, err := os.OpenFile(sst.manifestPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		slog.Error("Failed to open manifest file", "file", sst.manifestPath, "error", err)
+	if err := sst.appendTableToManifestLocked(sstFileName, 0); err != nil {
+		if removeErr := os.Remove(filePath); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("Failed to remove unpublished SSTable", "file", filePath, "error", removeErr)
+		}
+		slog.Error("Failed to append new table to manifest", "file", sst.manifestPath, "error", err)
 		return err
 	}
 
-	if _, err := mf.WriteString(sstFileName + "\n"); err != nil {
-		mf.Close()
-		slog.Error("Failed to write to manifest file", "file", sst.manifestPath, "error", err)
-		return err
-	}
-
-	if err := mf.Sync(); err != nil {
-		mf.Close()
-		slog.Error("Failed to fsync the manifest file", "error", err)
-		return err
-	}
-
-	if err := mf.Close(); err != nil {
-		slog.Error("Failed to close new manifest file after write", "file", sst.manifestPath, "error", err)
-		return err
-	}
-
-	//fysnc the manifest dir
-	if err := syncParentDir(sst.manifestPath); err != nil {
-		slog.Error("Failed to fsync the sstable dir", "error", err)
-		return err
-	}
 	slog.Info("SSTable written to disk with name", "name", sstFileName)
-
-	//add the entry to the table
-	sst.tables = append([]string{sstFileName}, sst.tables...)
-
 	return nil
 }
 
-func (sst *ssTable) writeSSTableFile(filePath string, m map[string]storageEntry) error {
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageEntry) error {
+	dirPath := filepath.Dir(filePath)
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return err
+	}
+
+	f, err := os.CreateTemp(dirPath, "."+filepath.Base(filePath)+".tmp-*")
 	if err != nil {
-		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
+		return err
+	}
+	tempPath := f.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := f.Chmod(0644); err != nil {
 		return err
 	}
 
@@ -167,21 +251,16 @@ func (sst *ssTable) writeSSTableFile(filePath string, m map[string]storageEntry)
 
 	for _, k := range keys {
 		v := m[k]
-		entry := ssTableEntry{K: k, V: v.Value, Type: v.Type}
-		line, err := json.Marshal(entry)
+		line, err := json.Marshal(ssTableEntry{K: k, V: v.Value, Type: v.Type})
 		if err != nil {
-			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
-			continue
+			return err
 		}
 		if _, err := f.Write(append(line, '\n')); err != nil {
-			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
-			continue
+			return err
 		}
 	}
 
 	if err := f.Sync(); err != nil {
-		f.Close()
-		slog.Error("Failed to fsync the sstable", "error", err)
 		return err
 	}
 
@@ -190,31 +269,55 @@ func (sst *ssTable) writeSSTableFile(filePath string, m map[string]storageEntry)
 		return err
 	}
 
-	if err := syncParentDir(filePath); err != nil {
-		slog.Error("Failed to fsync the sstable dir", "error", err)
+	if err := os.Rename(tempPath, filePath); err != nil {
 		return err
 	}
-
-	return nil
+	committed = true
+	return syncParentDir(filePath)
 }
 
-func (sst *ssTable) rewriteManifest(tables []string) error {
-	mf, err := os.OpenFile(sst.manifestPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+func (sst *sstableStore) rewriteManifestFromLevels(levels []sstableLevel) error {
+	sort.Slice(levels, func(i, j int) bool {
+		return levels[i].level < levels[j].level
+	})
+
+	mf, err := os.CreateTemp(filepath.Dir(sst.manifestPath), "."+filepath.Base(sst.manifestPath)+".tmp-*")
 	if err != nil {
-		slog.Error("Failed to open manifest file for rewrite", "file", sst.manifestPath, "error", err)
+		slog.Error("Failed to create temporary manifest", "file", sst.manifestPath, "error", err)
+		return err
+	}
+	tempPath := mf.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = mf.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := mf.Chmod(0644); err != nil {
 		return err
 	}
 
-	for _, table := range tables {
-		if _, err := mf.WriteString(table + "\n"); err != nil {
-			mf.Close()
-			slog.Error("Failed to write to manifest file", "file", sst.manifestPath, "error", err)
+	for _, levelEntry := range levels {
+		if _, err := mf.WriteString(fmt.Sprintf("[L%d]\n", levelEntry.level)); err != nil {
+			slog.Error("Failed to write manifest header", "file", sst.manifestPath, "error", err)
+			return err
+		}
+
+		for _, table := range levelEntry.tables {
+			if _, err := mf.WriteString(table + "\n"); err != nil {
+				slog.Error("Failed to write manifest table", "file", sst.manifestPath, "error", err)
+				return err
+			}
+		}
+
+		if _, err := mf.WriteString("\n"); err != nil {
+			slog.Error("Failed to write manifest separator", "file", sst.manifestPath, "error", err)
 			return err
 		}
 	}
 
 	if err := mf.Sync(); err != nil {
-		mf.Close()
 		slog.Error("Failed to fsync the manifest file", "error", err)
 		return err
 	}
@@ -224,56 +327,102 @@ func (sst *ssTable) rewriteManifest(tables []string) error {
 		return err
 	}
 
-	if err := syncParentDir(sst.manifestPath); err != nil {
-		slog.Error("Failed to fsync the manifest dir", "error", err)
+	if err := os.Rename(tempPath, sst.manifestPath); err != nil {
+		slog.Error("Failed to publish manifest", "temp_file", tempPath, "file", sst.manifestPath, "error", err)
 		return err
 	}
+	committed = true
+	return syncParentDir(sst.manifestPath)
+}
+
+func (sst *sstableStore) appendTableToManifestLocked(table string, level int) error {
+	levels, err := getAllSSTables(sst.dir, MAX_LEVELS)
+	if err != nil {
+		return err
+	}
+
+	inserted := false
+	for i := range levels {
+		if levels[i].level == level {
+			levels[i].tables = append(levels[i].tables, table)
+			inserted = true
+			break
+		}
+	}
+
+	if !inserted {
+		levels = append(levels, sstableLevel{
+			level:  level,
+			tables: []string{table},
+		})
+	}
+
+	if err := sst.rewriteManifestFromLevels(levels); err != nil {
+		return err
+	}
+
+	for i := range sst.levels {
+		if sst.levels[i].level == level {
+			sst.levels[i].tables = append(sst.levels[i].tables, table)
+			return nil
+		}
+	}
+
+	sst.levels = append(sst.levels, sstableLevel{level: level, tables: []string{table}})
+	sort.Slice(sst.levels, func(i, j int) bool {
+		return sst.levels[i].level < sst.levels[j].level
+	})
 
 	return nil
 }
 
-func (sst *ssTable) getKey(key string) (storageEntry, bool) {
-	for _, v := range sst.tables {
-		f, err := os.Open(filepath.Join(sst.dir, v))
-		if err != nil {
-			slog.Error("Error while reading the ss table")
-			log.Fatal(err)
-		}
+func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
+	sst.mu.RLock()
+	defer sst.mu.RUnlock()
 
-		scanner := bufio.NewScanner(f)
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			slog.Info("Read line", "data", line)
-			if line == "" {
+	for level := 0; level < MAX_LEVELS; level++ {
+		levelTables := sst.getLevelSSTablesLocked(level)
+		for i := len(levelTables) - 1; i >= 0; i-- {
+			v := levelTables[i]
+			f, err := os.Open(filepath.Join(sst.dir, fmt.Sprintf("l%d", level), v))
+			if err != nil {
+				slog.Error("Error while reading the ss table", "file", v, "error", err)
 				continue
 			}
 
-			var entry ssTableEntry
-			err := json.Unmarshal([]byte(line), &entry)
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if line == "" {
+					continue
+				}
 
-			if err != nil {
+				var entry ssTableEntry
+				if err := json.Unmarshal([]byte(line), &entry); err != nil {
+					f.Close()
+					log.Fatalf("error during reading sstable: %s", err)
+				}
+
+				if key == entry.K {
+					if entry.Type == "" {
+						entry.Type = entryTypePut
+					}
+
+					f.Close()
+					return storageEntry{
+						Type:  entry.Type,
+						Value: entry.V,
+					}, true
+				}
+			}
+
+			if err := scanner.Err(); err != nil {
+				f.Close()
 				log.Fatalf("error during reading sstable: %s", err)
 			}
 
-			if key == entry.K {
-				if entry.Type == "" {
-					entry.Type = entryTypePut
-				}
-
-				f.Close()
-				return storageEntry{
-					Type:  entry.Type,
-					Value: entry.V,
-				}, true
-			}
+			f.Close()
 		}
-
-		if err := scanner.Err(); err != nil {
-			log.Fatalf("error during reading sstable: %s", err)
-		}
-
-		f.Close()
 	}
 	return storageEntry{}, false
 }

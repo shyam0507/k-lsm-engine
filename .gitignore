@@ -1,3 +1,4 @@
 data/
 testdata/
 .DS_Store
+.vscode
