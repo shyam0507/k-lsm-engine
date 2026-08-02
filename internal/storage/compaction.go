@@ -17,6 +17,7 @@ type sstableReader struct {
 	scanner *bufio.Scanner
 	entry   ssTableEntry
 	hasNext bool
+	path    string
 }
 
 func newSSTableReader(path string) (*sstableReader, error) {
@@ -28,6 +29,7 @@ func newSSTableReader(path string) (*sstableReader, error) {
 	r := &sstableReader{
 		file:    f,
 		scanner: bufio.NewScanner(f),
+		path:    path,
 	}
 	return r, nil
 }
@@ -41,7 +43,7 @@ func (r *sstableReader) advance() error {
 
 		var entry ssTableEntry
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			return err
+			return fmt.Errorf("decode SSTable entry in %s: %w", r.path, err)
 		}
 
 		r.entry = entry
@@ -92,15 +94,64 @@ func (h *sstableHeap) Pop() any {
 	return item
 }
 
+func (sst *sstableStore) pruneLevelTables(level int, tables []string) []string {
+	pruned := make([]string, 0, len(tables))
+	for _, table := range tables {
+		tablePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", level), table)
+		_, statErr := os.Stat(tablePath)
+		if statErr == nil {
+			pruned = append(pruned, table)
+			continue
+		}
+
+		if !os.IsNotExist(statErr) {
+			slog.Warn("Skipping unreadable SSTable while pruning level state", "level", level, "table", table, "path", tablePath, "error", statErr)
+			continue
+		}
+
+		slog.Warn("Removing missing SSTable from manifest state", "level", level, "table", table, "path", tablePath)
+	}
+
+	return pruned
+}
+
+func getTablesForLevel(levels []sstableLevel, level int) []string {
+	for _, levelEntry := range levels {
+		if levelEntry.level == level {
+			return levelEntry.tables
+		}
+	}
+	return nil
+}
+
 // by default compact level 0 and level 1
 // compact and store to level 1
 func (sst *sstableStore) compactSSTables() error {
-	l0Tables := sst.getLevelSSTables(0)
+	sst.mu.Lock()
+	defer sst.mu.Unlock()
+
+	prunedLevels := make([]sstableLevel, 0, len(sst.levels))
+	for _, existing := range sst.levels {
+		switch existing.level {
+		case 0:
+			prunedLevels = append(prunedLevels, sstableLevel{level: 0, tables: sst.pruneLevelTables(0, existing.tables)})
+		case 1:
+			prunedLevels = append(prunedLevels, sstableLevel{level: 1, tables: sst.pruneLevelTables(1, existing.tables)})
+		default:
+			prunedLevels = append(prunedLevels, existing)
+		}
+	}
+
+	l0Tables := getTablesForLevel(prunedLevels, 0)
 	if len(l0Tables) < 2 {
+		if err := sst.rewriteManifestFromLevels(prunedLevels); err != nil {
+			return err
+		}
+		sst.levels = prunedLevels
 		return nil
 	}
 
-	l1Tables := sst.getLevelSSTables(1)
+	l1Tables := getTablesForLevel(prunedLevels, 1)
 	readers := make([]*sstableReader, 0, len(l0Tables)+len(l1Tables))
 	h := &sstableHeap{}
 
@@ -114,8 +165,13 @@ func (sst *sstableStore) compactSSTables() error {
 
 	addTables := func(level int, tables []string) error {
 		for _, table := range tables {
-			r, err := newSSTableReader(filepath.Join(sst.dir, fmt.Sprintf("l%d", level), table))
+			tablePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", level), table)
+			r, err := newSSTableReader(tablePath)
 			if err != nil {
+				if os.IsNotExist(err) {
+					slog.Warn("Skipping missing SSTable during compaction", "level", level, "table", table, "path", tablePath)
+					continue
+				}
 				return err
 			}
 
@@ -152,20 +208,42 @@ func (sst *sstableStore) compactSSTables() error {
 	heap.Init(h)
 
 	newTables := make([]string, 0)
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		for _, table := range newTables {
+			if err := os.Remove(filepath.Join(sst.dir, "l1", table)); err != nil && !os.IsNotExist(err) {
+				slog.Warn("Failed to remove unpublished compacted SSTable", "table", table, "error", err)
+			}
+		}
+	}()
 	chunk := make(map[string]storageEntry, FLUSH_THRESHOLD)
 	chunkCount := 0
+	mergedEntries := 0
 	var currentKey string
 	first := true
 
-	nextL1Index := len(l1Tables) + 1
+	nextL1Index := getNextSSTableIndex(l1Tables)
 	flushChunk := func() error {
 		if chunkCount == 0 {
 			return nil
 		}
 
-		newTableName := fmt.Sprintf("%s%d%s", ssTablePrefix, nextL1Index, ssTableExt)
-		nextL1Index++
-		newFilePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", 1), newTableName)
+		var newTableName, newFilePath string
+		for {
+			newTableName = fmt.Sprintf("%s%d%s", ssTablePrefix, nextL1Index, ssTableExt)
+			nextL1Index++
+			newFilePath = filepath.Join(sst.dir, "l1", newTableName)
+			_, err := os.Stat(newFilePath)
+			if os.IsNotExist(err) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+		}
 		if err := sst.writeSSTableFile(newFilePath, chunk); err != nil {
 			return err
 		}
@@ -189,6 +267,7 @@ func (sst *sstableStore) compactSSTables() error {
 
 			chunk[item.key] = item.entry
 			chunkCount++
+			mergedEntries++
 			currentKey = item.key
 			first = false
 		}
@@ -219,8 +298,8 @@ func (sst *sstableStore) compactSSTables() error {
 	oldTablesLevel0 := append([]string(nil), l0Tables...)
 	oldTablesLevel1 := append([]string(nil), l1Tables...)
 
-	levels := make([]sstableLevel, 0, len(sst.levels))
-	for _, existing := range sst.levels {
+	levels := make([]sstableLevel, 0, len(prunedLevels))
+	for _, existing := range prunedLevels {
 		if existing.level == 0 || existing.level == 1 {
 			continue
 		}
@@ -238,6 +317,7 @@ func (sst *sstableStore) compactSSTables() error {
 	}
 
 	sst.levels = levels
+	published = true
 
 	for _, table := range oldTablesLevel0 {
 		if err := os.Remove(filepath.Join(sst.dir, "l0", table)); err != nil && !os.IsNotExist(err) {
@@ -251,6 +331,6 @@ func (sst *sstableStore) compactSSTables() error {
 		}
 	}
 
-	slog.Info("SSTable compaction completed", "new_tables", len(newTables), "merged_entries", len(newTables)*FLUSH_THRESHOLD)
+	slog.Info("SSTable compaction completed", "new_tables", len(newTables), "merged_entries", mergedEntries)
 	return nil
 }

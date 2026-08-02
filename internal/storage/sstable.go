@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const (
@@ -34,6 +35,7 @@ type sstableStore struct {
 	dir          string
 	manifestPath string
 	levels       []sstableLevel
+	mu           sync.RWMutex
 }
 
 func newSSTableStore(dir string) *sstableStore {
@@ -43,6 +45,8 @@ func newSSTableStore(dir string) *sstableStore {
 		log.Fatal("Error while parsing/loading sstable", err)
 	}
 
+	levels = pruneLevelsFromDisk(dir, levels)
+
 	return &sstableStore{
 		levels:       levels,
 		dir:          dir,
@@ -50,11 +54,37 @@ func newSSTableStore(dir string) *sstableStore {
 	}
 }
 
+func pruneLevelsFromDisk(dir string, levels []sstableLevel) []sstableLevel {
+	pruned := make([]sstableLevel, 0, len(levels))
+	for _, levelEntry := range levels {
+		prunedTables := make([]string, 0, len(levelEntry.tables))
+		for _, table := range levelEntry.tables {
+			tablePath := filepath.Join(dir, fmt.Sprintf("l%d", levelEntry.level), table)
+			_, statErr := os.Stat(tablePath)
+			if statErr == nil {
+				prunedTables = append(prunedTables, table)
+				continue
+			}
+			if !os.IsNotExist(statErr) {
+				slog.Warn("Skipping unreadable SSTable while rebuilding level state", "level", levelEntry.level, "table", table, "path", tablePath, "error", statErr)
+			}
+		}
+		pruned = append(pruned, sstableLevel{level: levelEntry.level, tables: prunedTables})
+	}
+	return pruned
+}
+
 // return the sstable slice of a level
 func (sst *sstableStore) getLevelSSTables(level int) []string {
+	sst.mu.RLock()
+	defer sst.mu.RUnlock()
+	return sst.getLevelSSTablesLocked(level)
+}
+
+func (sst *sstableStore) getLevelSSTablesLocked(level int) []string {
 	for _, v := range sst.levels {
 		if v.level == level {
-			return v.tables
+			return append([]string(nil), v.tables...)
 		}
 	}
 	return nil
@@ -125,11 +155,35 @@ func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
 	return levels, nil
 }
 
-func (sst *sstableStore) getSSTableName(level int) string {
+func getSSTableIndex(table string) int {
+	if !strings.HasPrefix(table, ssTablePrefix) || !strings.HasSuffix(table, ssTableExt) {
+		return 0
+	}
+
+	numPart := strings.TrimSuffix(strings.TrimPrefix(table, ssTablePrefix), ssTableExt)
+	idx, err := strconv.Atoi(numPart)
+	if err != nil || idx <= 0 {
+		return 0
+	}
+
+	return idx
+}
+
+func getNextSSTableIndex(tables []string) int {
+	maxIdx := 0
+	for _, table := range tables {
+		if idx := getSSTableIndex(table); idx > maxIdx {
+			maxIdx = idx
+		}
+	}
+	return maxIdx + 1
+}
+
+func (sst *sstableStore) getNewSSTableName(level int) string {
 	count := 1
 	for _, v := range sst.levels {
 		if v.level == level {
-			count = 1 + len(v.tables)
+			count = getNextSSTableIndex(v.tables)
 			break
 		}
 	}
@@ -138,8 +192,11 @@ func (sst *sstableStore) getSSTableName(level int) string {
 
 // saves ss table to level 0
 func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
+	sst.mu.Lock()
+	defer sst.mu.Unlock()
+
 	slog.Info("SaveSSTable called")
-	sstFileName := sst.getSSTableName(0)
+	sstFileName := sst.getNewSSTableName(0)
 	filePath := filepath.Join(sst.dir, "l0", sstFileName)
 
 	if err := sst.writeSSTableFile(filePath, m); err != nil {
@@ -152,7 +209,10 @@ func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
 	/*
 		Now modify the manifest file
 	*/
-	if err := sst.appendTableToManifest(sstFileName, 0); err != nil {
+	if err := sst.appendTableToManifestLocked(sstFileName, 0); err != nil {
+		if removeErr := os.Remove(filePath); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("Failed to remove unpublished SSTable", "file", filePath, "error", removeErr)
+		}
 		slog.Error("Failed to append new table to manifest", "file", sst.manifestPath, "error", err)
 		return err
 	}
@@ -162,17 +222,24 @@ func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
 }
 
 func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageEntry) error {
-	// Ensure the sstable directory exists
 	dirPath := filepath.Dir(filePath)
-	err := os.MkdirAll(dirPath, 0755)
-	if err != nil {
-		slog.Error("Failed to create sstable directory", "dir", dirPath, "error", err)
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
 		return err
 	}
 
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.CreateTemp(dirPath, "."+filepath.Base(filePath)+".tmp-*")
 	if err != nil {
-		slog.Error("Failed to open SSTable file for writing", "file", filePath, "error", err)
+		return err
+	}
+	tempPath := f.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = f.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := f.Chmod(0644); err != nil {
 		return err
 	}
 
@@ -184,21 +251,16 @@ func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageE
 
 	for _, k := range keys {
 		v := m[k]
-		entry := ssTableEntry{K: k, V: v.Value, Type: v.Type}
-		line, err := json.Marshal(entry)
+		line, err := json.Marshal(ssTableEntry{K: k, V: v.Value, Type: v.Type})
 		if err != nil {
-			slog.Error("Failed to marshal SSTable entry", "key", k, "error", err)
-			continue
+			return err
 		}
 		if _, err := f.Write(append(line, '\n')); err != nil {
-			slog.Error("Failed to write SSTable entry to file", "key", k, "error", err)
-			continue
+			return err
 		}
 	}
 
 	if err := f.Sync(); err != nil {
-		f.Close()
-		slog.Error("Failed to fsync the sstable", "error", err)
 		return err
 	}
 
@@ -207,12 +269,11 @@ func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageE
 		return err
 	}
 
-	if err := syncParentDir(filePath); err != nil {
-		slog.Error("Failed to fsync the sstable dir", "error", err)
+	if err := os.Rename(tempPath, filePath); err != nil {
 		return err
 	}
-
-	return nil
+	committed = true
+	return syncParentDir(filePath)
 }
 
 func (sst *sstableStore) rewriteManifestFromLevels(levels []sstableLevel) error {
@@ -220,36 +281,43 @@ func (sst *sstableStore) rewriteManifestFromLevels(levels []sstableLevel) error 
 		return levels[i].level < levels[j].level
 	})
 
-	mf, err := os.OpenFile(sst.manifestPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	mf, err := os.CreateTemp(filepath.Dir(sst.manifestPath), "."+filepath.Base(sst.manifestPath)+".tmp-*")
 	if err != nil {
-		slog.Error("Failed to open manifest file for rewrite", "file", sst.manifestPath, "error", err)
+		slog.Error("Failed to create temporary manifest", "file", sst.manifestPath, "error", err)
+		return err
+	}
+	tempPath := mf.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = mf.Close()
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := mf.Chmod(0644); err != nil {
 		return err
 	}
 
 	for _, levelEntry := range levels {
 		if _, err := mf.WriteString(fmt.Sprintf("[L%d]\n", levelEntry.level)); err != nil {
-			mf.Close()
 			slog.Error("Failed to write manifest header", "file", sst.manifestPath, "error", err)
 			return err
 		}
 
 		for _, table := range levelEntry.tables {
 			if _, err := mf.WriteString(table + "\n"); err != nil {
-				mf.Close()
 				slog.Error("Failed to write manifest table", "file", sst.manifestPath, "error", err)
 				return err
 			}
 		}
 
 		if _, err := mf.WriteString("\n"); err != nil {
-			mf.Close()
 			slog.Error("Failed to write manifest separator", "file", sst.manifestPath, "error", err)
 			return err
 		}
 	}
 
 	if err := mf.Sync(); err != nil {
-		mf.Close()
 		slog.Error("Failed to fsync the manifest file", "error", err)
 		return err
 	}
@@ -259,15 +327,15 @@ func (sst *sstableStore) rewriteManifestFromLevels(levels []sstableLevel) error 
 		return err
 	}
 
-	if err := syncParentDir(sst.manifestPath); err != nil {
-		slog.Error("Failed to fsync the manifest dir", "error", err)
+	if err := os.Rename(tempPath, sst.manifestPath); err != nil {
+		slog.Error("Failed to publish manifest", "temp_file", tempPath, "file", sst.manifestPath, "error", err)
 		return err
 	}
-
-	return nil
+	committed = true
+	return syncParentDir(sst.manifestPath)
 }
 
-func (sst *sstableStore) appendTableToManifest(table string, level int) error {
+func (sst *sstableStore) appendTableToManifestLocked(table string, level int) error {
 	levels, err := getAllSSTables(sst.dir, MAX_LEVELS)
 	if err != nil {
 		return err
@@ -309,8 +377,11 @@ func (sst *sstableStore) appendTableToManifest(table string, level int) error {
 }
 
 func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
+	sst.mu.RLock()
+	defer sst.mu.RUnlock()
+
 	for level := 0; level < MAX_LEVELS; level++ {
-		levelTables := sst.getLevelSSTables(level)
+		levelTables := sst.getLevelSSTablesLocked(level)
 		for i := len(levelTables) - 1; i >= 0; i-- {
 			v := levelTables[i]
 			f, err := os.Open(filepath.Join(sst.dir, fmt.Sprintf("l%d", level), v))

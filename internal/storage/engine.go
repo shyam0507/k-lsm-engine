@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	FLUSH_THRESHOLD      = 2000
+	FLUSH_THRESHOLD      = 200
 	COMPACTION_THRESHOLD = 5 //compact when number of tables are met
 	MAX_LEVELS           = 2
 )
@@ -151,7 +151,8 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 }
 
 func (e *Engine) maybeCompactIfNeeded() {
-	if len(e.ssTableStore.getLevelSSTables(0)) < COMPACTION_THRESHOLD {
+	slog.Info("Compaction Called", "Table Length", e.ssTableStore.getLevelSSTables(0))
+	if len(e.ssTableStore.getLevelSSTables(0)) != COMPACTION_THRESHOLD {
 		return
 	}
 
