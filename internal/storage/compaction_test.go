@@ -1,11 +1,57 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCompactionStoresAndUsesL1KeyRanges(t *testing.T) {
+	dir := t.TempDir()
+	sst := newSSTableStore(dir)
+
+	for table := 0; table < 2; table++ {
+		entries := make(map[string]storageEntry, FLUSH_THRESHOLD)
+		for i := 0; i < FLUSH_THRESHOLD; i++ {
+			key := fmt.Sprintf("key-%03d", table*FLUSH_THRESHOLD+i)
+			entries[key] = storageEntry{Type: entryTypePut, Value: key}
+		}
+		if err := sst.saveLevel0SSTable(entries); err != nil {
+			t.Fatalf("save L0 table %d: %v", table, err)
+		}
+	}
+
+	if err := sst.compactSSTables(); err != nil {
+		t.Fatalf("compactSSTables: %v", err)
+	}
+
+	l1Tables := sst.getLevelSSTables(1)
+	if len(l1Tables) != 2 {
+		t.Fatalf("expected two L1 tables, got %v", l1Tables)
+	}
+	manifest, err := os.ReadFile(filepath.Join(dir, MANIFEST_FILE_NAME))
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if !strings.Contains(string(manifest), "\t\"key-000\"\t\"key-199\"") || !strings.Contains(string(manifest), "\t\"key-200\"\t\"key-399\"") {
+		t.Fatalf("manifest does not contain L1 key ranges:\n%s", manifest)
+	}
+
+	// Reopening verifies that ranges are read from the manifest, not only held
+	// in memory, and getKey remains correct when it skips out-of-range tables.
+	reopened := newSSTableStore(dir)
+	if got, ok := reopened.getKey("key-010"); !ok || got.Value != "key-010" {
+		t.Fatalf("getKey after reopening = (%+v, %t), want key-010", got, ok)
+	}
+	if !l1TableMayContain("key-010", sstableKeyRange{min: "key-000", max: "key-199"}, true) {
+		t.Fatal("expected in-range key to select its L1 table")
+	}
+	if l1TableMayContain("key-010", sstableKeyRange{min: "key-200", max: "key-399"}, true) {
+		t.Fatal("expected out-of-range key to skip the L1 table")
+	}
+}
 
 func TestCompactionPreservesTablesWhenAnEntryIsMalformed(t *testing.T) {
 	dir := t.TempDir()

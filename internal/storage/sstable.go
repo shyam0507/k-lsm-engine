@@ -28,8 +28,16 @@ type ssTableEntry struct {
 }
 
 type sstableLevel struct {
-	tables []string
-	level  int
+	tables    []string
+	keyRanges map[string]sstableKeyRange // populated for L1 tables
+	level     int
+}
+
+// sstableKeyRange is inclusive. L1 tables are sorted and non-overlapping, so
+// the range lets reads avoid opening tables that cannot contain a key.
+type sstableKeyRange struct {
+	min string
+	max string
 }
 type sstableStore struct {
 	dir          string
@@ -69,7 +77,13 @@ func pruneLevelsFromDisk(dir string, levels []sstableLevel) []sstableLevel {
 				slog.Warn("Skipping unreadable SSTable while rebuilding level state", "level", levelEntry.level, "table", table, "path", tablePath, "error", statErr)
 			}
 		}
-		pruned = append(pruned, sstableLevel{level: levelEntry.level, tables: prunedTables})
+		prunedRanges := make(map[string]sstableKeyRange, len(prunedTables))
+		for _, table := range prunedTables {
+			if keyRange, ok := levelEntry.keyRanges[table]; ok {
+				prunedRanges[table] = keyRange
+			}
+		}
+		pruned = append(pruned, sstableLevel{level: levelEntry.level, tables: prunedTables, keyRanges: prunedRanges})
 	}
 	return pruned
 }
@@ -90,6 +104,10 @@ func (sst *sstableStore) getLevelSSTablesLocked(level int) []string {
 	return nil
 }
 
+func l1TableMayContain(key string, keyRange sstableKeyRange, hasRange bool) bool {
+	return !hasRange || (key >= keyRange.min && key <= keyRange.max)
+}
+
 // getAllSSTables reads the manifest file from the SSTable directory and returns
 // loaded table names in reverse order plus the current counter.
 func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
@@ -107,6 +125,7 @@ func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
 	scanner := bufio.NewScanner(f)
 	var currentLevel = -1
 	var tables []string
+	var keyRanges map[string]sstableKeyRange
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -118,8 +137,9 @@ func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
 		case regexp.MustCompile(`^\[L[0-9]+\]$`).MatchString(line):
 			if currentLevel >= 0 {
 				levels = append(levels, sstableLevel{
-					tables: tables,
-					level:  currentLevel,
+					tables:    tables,
+					keyRanges: keyRanges,
+					level:     currentLevel,
 				})
 			}
 
@@ -130,6 +150,7 @@ func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
 			}
 			currentLevel = idx
 			tables = nil
+			keyRanges = make(map[string]sstableKeyRange)
 			if currentLevel > upToLevel {
 				break
 			}
@@ -137,7 +158,14 @@ func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
 			if currentLevel < 0 {
 				continue
 			}
-			tables = append(tables, line)
+			table, keyRange, hasRange, err := parseManifestTable(line, currentLevel)
+			if err != nil {
+				return levels, err
+			}
+			tables = append(tables, table)
+			if hasRange {
+				keyRanges[table] = keyRange
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -147,12 +175,39 @@ func getAllSSTables(dir string, upToLevel int) ([]sstableLevel, error) {
 
 	if currentLevel >= 0 {
 		levels = append(levels, sstableLevel{
-			tables: tables,
-			level:  currentLevel,
+			tables:    tables,
+			keyRanges: keyRanges,
+			level:     currentLevel,
 		})
 	}
 
 	return levels, nil
+}
+
+// L1 entries are encoded as: <table>\t<quoted-min-key>\t<quoted-max-key>.
+// Quoting keeps arbitrary string keys, including whitespace, unambiguous.
+// Entries without bounds are accepted for manifests written by older versions.
+func parseManifestTable(line string, level int) (string, sstableKeyRange, bool, error) {
+	if level != 1 || !strings.Contains(line, "\t") {
+		return line, sstableKeyRange{}, false, nil
+	}
+
+	parts := strings.Split(line, "\t")
+	if len(parts) != 3 || parts[0] == "" {
+		return "", sstableKeyRange{}, false, fmt.Errorf("invalid L1 manifest entry %q", line)
+	}
+	minKey, err := strconv.Unquote(parts[1])
+	if err != nil {
+		return "", sstableKeyRange{}, false, fmt.Errorf("decode L1 minimum key for %s: %w", parts[0], err)
+	}
+	maxKey, err := strconv.Unquote(parts[2])
+	if err != nil {
+		return "", sstableKeyRange{}, false, fmt.Errorf("decode L1 maximum key for %s: %w", parts[0], err)
+	}
+	if minKey > maxKey {
+		return "", sstableKeyRange{}, false, fmt.Errorf("invalid L1 key range for %s: %q > %q", parts[0], minKey, maxKey)
+	}
+	return parts[0], sstableKeyRange{min: minKey, max: maxKey}, true, nil
 }
 
 func getSSTableIndex(table string) int {
@@ -305,7 +360,13 @@ func (sst *sstableStore) rewriteManifestFromLevels(levels []sstableLevel) error 
 		}
 
 		for _, table := range levelEntry.tables {
-			if _, err := mf.WriteString(table + "\n"); err != nil {
+			line := table
+			if levelEntry.level == 1 {
+				if keyRange, ok := levelEntry.keyRanges[table]; ok {
+					line = fmt.Sprintf("%s\t%q\t%q", table, keyRange.min, keyRange.max)
+				}
+			}
+			if _, err := mf.WriteString(line + "\n"); err != nil {
 				slog.Error("Failed to write manifest table", "file", sst.manifestPath, "error", err)
 				return err
 			}
@@ -382,8 +443,20 @@ func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 
 	for level := 0; level < MAX_LEVELS; level++ {
 		levelTables := sst.getLevelSSTablesLocked(level)
+		var keyRanges map[string]sstableKeyRange
+		if level == 1 {
+			for _, levelEntry := range sst.levels {
+				if levelEntry.level == level {
+					keyRanges = levelEntry.keyRanges
+					break
+				}
+			}
+		}
 		for i := len(levelTables) - 1; i >= 0; i-- {
 			v := levelTables[i]
+			if keyRange, ok := keyRanges[v]; !l1TableMayContain(key, keyRange, ok) {
+				continue
+			}
 			f, err := os.Open(filepath.Join(sst.dir, fmt.Sprintf("l%d", level), v))
 			if err != nil {
 				slog.Error("Error while reading the ss table", "file", v, "error", err)

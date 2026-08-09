@@ -136,7 +136,14 @@ func (sst *sstableStore) compactSSTables() error {
 		case 0:
 			prunedLevels = append(prunedLevels, sstableLevel{level: 0, tables: sst.pruneLevelTables(0, existing.tables)})
 		case 1:
-			prunedLevels = append(prunedLevels, sstableLevel{level: 1, tables: sst.pruneLevelTables(1, existing.tables)})
+			prunedTables := sst.pruneLevelTables(1, existing.tables)
+			prunedRanges := make(map[string]sstableKeyRange, len(prunedTables))
+			for _, table := range prunedTables {
+				if keyRange, ok := existing.keyRanges[table]; ok {
+					prunedRanges[table] = keyRange
+				}
+			}
+			prunedLevels = append(prunedLevels, sstableLevel{level: 1, tables: prunedTables, keyRanges: prunedRanges})
 		default:
 			prunedLevels = append(prunedLevels, existing)
 		}
@@ -208,6 +215,7 @@ func (sst *sstableStore) compactSSTables() error {
 	heap.Init(h)
 
 	newTables := make([]string, 0)
+	newTableRanges := make(map[string]sstableKeyRange)
 	published := false
 	defer func() {
 		if published {
@@ -221,6 +229,8 @@ func (sst *sstableStore) compactSSTables() error {
 	}()
 	chunk := make(map[string]storageEntry, FLUSH_THRESHOLD)
 	chunkCount := 0
+	chunkMinKey := ""
+	chunkMaxKey := ""
 	mergedEntries := 0
 	var currentKey string
 	first := true
@@ -249,8 +259,11 @@ func (sst *sstableStore) compactSSTables() error {
 		}
 
 		newTables = append(newTables, newTableName)
+		newTableRanges[newTableName] = sstableKeyRange{min: chunkMinKey, max: chunkMaxKey}
 		chunk = make(map[string]storageEntry, FLUSH_THRESHOLD)
 		chunkCount = 0
+		chunkMinKey = ""
+		chunkMaxKey = ""
 		return nil
 	}
 
@@ -267,6 +280,10 @@ func (sst *sstableStore) compactSSTables() error {
 
 			chunk[item.key] = item.entry
 			chunkCount++
+			if chunkCount == 1 {
+				chunkMinKey = item.key
+			}
+			chunkMaxKey = item.key
 			mergedEntries++
 			currentKey = item.key
 			first = false
@@ -307,7 +324,7 @@ func (sst *sstableStore) compactSSTables() error {
 	}
 
 	levels = append(levels, sstableLevel{level: 0, tables: nil})
-	levels = append(levels, sstableLevel{level: 1, tables: newTables})
+	levels = append(levels, sstableLevel{level: 1, tables: newTables, keyRanges: newTableRanges})
 	sort.Slice(levels, func(i, j int) bool {
 		return levels[i].level < levels[j].level
 	})
