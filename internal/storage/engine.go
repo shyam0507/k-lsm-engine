@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	FLUSH_THRESHOLD      = 2000
+	FLUSH_THRESHOLD      = sstableMaxEntries
 	COMPACTION_THRESHOLD = 5 //compact when number of tables are met
 	MAX_LEVELS           = 2
 )

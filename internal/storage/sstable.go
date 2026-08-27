@@ -2,14 +2,12 @@ package storage
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +22,7 @@ const (
 type ssTableEntry struct {
 	K    string    `json:"k"`
 	V    string    `json:"v"`
-	Type entryType `json:"type"`
+	Type entryType `json:"type"` //not peristed on disk used in memory only
 }
 
 type sstableLevel struct {
@@ -259,7 +257,7 @@ func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
 		return err
 	}
 
-	slog.Info("SSTable file written in JSON Lines format and dir synched", "file", filePath)
+	slog.Info("Block-based SSTable file written and directory synched", "file", filePath)
 
 	/*
 		Now modify the manifest file
@@ -302,17 +300,14 @@ func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageE
 	for k := range m {
 		keys = append(keys, k)
 	}
-	slices.Sort(keys)
-
+	sort.Strings(keys)
+	entries := make([]ssTableEntry, 0, len(keys))
 	for _, k := range keys {
 		v := m[k]
-		line, err := json.Marshal(ssTableEntry{K: k, V: v.Value, Type: v.Type})
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(append(line, '\n')); err != nil {
-			return err
-		}
+		entries = append(entries, ssTableEntry{K: k, V: v.Value, Type: v.Type})
+	}
+	if err := writeBlockBasedTable(f, entries); err != nil {
+		return err
 	}
 
 	if err := f.Sync(); err != nil {
@@ -457,44 +452,24 @@ func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 			if keyRange, ok := keyRanges[v]; !l1TableMayContain(key, keyRange, ok) {
 				continue
 			}
-			f, err := os.Open(filepath.Join(sst.dir, fmt.Sprintf("l%d", level), v))
+			tablePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", level), v)
+			table, err := openBlockBasedTable(tablePath)
 			if err != nil {
-				slog.Error("Error while reading the ss table", "file", v, "error", err)
+				slog.Error("Error while opening block-based SSTable", "file", v, "error", err)
 				continue
 			}
-
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				line := scanner.Text()
-				if line == "" {
-					continue
-				}
-
-				var entry ssTableEntry
-				if err := json.Unmarshal([]byte(line), &entry); err != nil {
-					f.Close()
-					log.Fatalf("error during reading sstable: %s", err)
-				}
-
-				if key == entry.K {
-					if entry.Type == "" {
-						entry.Type = entryTypePut
-					}
-
-					f.Close()
-					return storageEntry{
-						Type:  entry.Type,
-						Value: entry.V,
-					}, true
-				}
+			entry, found, err := table.get(key)
+			closeErr := table.close()
+			if err != nil {
+				slog.Error("Error while reading block-based SSTable", "file", v, "error", err)
+				continue
 			}
-
-			if err := scanner.Err(); err != nil {
-				f.Close()
-				log.Fatalf("error during reading sstable: %s", err)
+			if closeErr != nil {
+				slog.Warn("Error while closing block-based SSTable", "file", v, "error", closeErr)
 			}
-
-			f.Close()
+			if found {
+				return entry, true
+			}
 		}
 	}
 	return storageEntry{}, false

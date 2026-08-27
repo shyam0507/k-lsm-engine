@@ -1,66 +1,62 @@
 package storage
 
 import (
-	"bufio"
 	"container/heap"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 type sstableReader struct {
-	file    *os.File
-	scanner *bufio.Scanner
+	table   *blockBasedTable
+	block   int
+	entries []ssTableEntry
+	entryAt int
 	entry   ssTableEntry
 	hasNext bool
 	path    string
 }
 
 func newSSTableReader(path string) (*sstableReader, error) {
-	f, err := os.Open(path)
+	table, err := openBlockBasedTable(path)
 	if err != nil {
 		return nil, err
 	}
 
 	r := &sstableReader{
-		file:    f,
-		scanner: bufio.NewScanner(f),
-		path:    path,
+		table: table,
+		path:  path,
 	}
 	return r, nil
 }
 
 func (r *sstableReader) advance() error {
-	for r.scanner.Scan() {
-		line := strings.TrimSpace(r.scanner.Text())
-		if line == "" {
-			continue
+	for r.block < len(r.table.index) {
+		if r.entries == nil {
+			entries, err := r.table.readBlock(r.block)
+			if err != nil {
+				return fmt.Errorf("decode SSTable block in %s: %w", r.path, err)
+			}
+			r.entries = entries
+			r.entryAt = 0
 		}
-
-		var entry ssTableEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			return fmt.Errorf("decode SSTable entry in %s: %w", r.path, err)
+		if r.entryAt < len(r.entries) {
+			r.entry = r.entries[r.entryAt]
+			r.entryAt++
+			r.hasNext = true
+			return nil
 		}
-
-		r.entry = entry
-		r.hasNext = true
-		return nil
+		r.block++
+		r.entries = nil
 	}
-
-	if err := r.scanner.Err(); err != nil {
-		return err
-	}
-
 	r.hasNext = false
 	return nil
 }
 
 func (r *sstableReader) close() error {
-	return r.file.Close()
+	return r.table.close()
 }
 
 type sstableHeapItem struct {
