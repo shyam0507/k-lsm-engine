@@ -223,7 +223,9 @@ func (sst *sstableStore) compactSSTables() error {
 			}
 		}
 	}()
-	chunk := make(map[string]storageEntry, FLUSH_THRESHOLD)
+	// The merge heap emits keys in ascending order, so chunks are already
+	// sorted and can be written without converting through a map or sorting.
+	chunk := make([]ssTableEntry, 0, FLUSH_THRESHOLD)
 	chunkCount := 0
 	chunkMinKey := ""
 	chunkMaxKey := ""
@@ -250,13 +252,13 @@ func (sst *sstableStore) compactSSTables() error {
 				return err
 			}
 		}
-		if err := sst.writeSSTableFile(newFilePath, chunk); err != nil {
+		if err := sst.writeSortedSSTableFile(newFilePath, chunk); err != nil {
 			return err
 		}
 
 		newTables = append(newTables, newTableName)
 		newTableRanges[newTableName] = sstableKeyRange{min: chunkMinKey, max: chunkMaxKey}
-		chunk = make(map[string]storageEntry, FLUSH_THRESHOLD)
+		chunk = make([]ssTableEntry, 0, FLUSH_THRESHOLD)
 		chunkCount = 0
 		chunkMinKey = ""
 		chunkMaxKey = ""
@@ -274,7 +276,7 @@ func (sst *sstableStore) compactSSTables() error {
 				}
 			}
 
-			chunk[item.key] = item.entry
+			chunk = append(chunk, ssTableEntry{K: item.key, V: item.entry.Value, Type: item.entry.Type})
 			chunkCount++
 			if chunkCount == 1 {
 				chunkMinKey = item.key

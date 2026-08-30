@@ -88,13 +88,18 @@ func (l *skipList) get(key string) (storageEntry, bool) {
 	return storageEntry{}, false
 }
 
-func (l *skipList) getAllKeys() map[string]storageEntry {
-	data := make(map[string]storageEntry, l.size)
+// entries returns a point-in-time, key-sorted snapshot of the list.
+func (l *skipList) entries() []ssTableEntry {
+	entries := make([]ssTableEntry, 0, l.size)
 	for current := l.head.next[0]; current != nil; current = current.next[0] {
-		data[current.key] = current.value
+		entries = append(entries, ssTableEntry{
+			K:    current.key,
+			V:    current.value.Value,
+			Type: current.value.Type,
+		})
 	}
 
-	return data
+	return entries
 }
 
 func (l *skipList) clear() bool {

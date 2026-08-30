@@ -245,6 +245,19 @@ func (sst *sstableStore) getNewSSTableName(level int) string {
 
 // saves ss table to level 0
 func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
+	return sst.saveLevel0SSTableWithWriter(func(filePath string) error {
+		return sst.writeSSTableFile(filePath, m)
+	})
+}
+
+// saveLevel0SSTableEntries saves entries that are already sorted by key.
+func (sst *sstableStore) saveLevel0SSTableEntries(entries []ssTableEntry) error {
+	return sst.saveLevel0SSTableWithWriter(func(filePath string) error {
+		return sst.writeSortedSSTableFile(filePath, entries)
+	})
+}
+
+func (sst *sstableStore) saveLevel0SSTableWithWriter(writeTable func(filePath string) error) error {
 	sst.mu.Lock()
 	defer sst.mu.Unlock()
 
@@ -252,7 +265,7 @@ func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
 	sstFileName := sst.getNewSSTableName(0)
 	filePath := filepath.Join(sst.dir, "l0", sstFileName)
 
-	if err := sst.writeSSTableFile(filePath, m); err != nil {
+	if err := writeTable(filePath); err != nil {
 		slog.Error("Failed to write SSTable file", "file", filePath, "error", err)
 		return err
 	}
@@ -275,6 +288,23 @@ func (sst *sstableStore) saveLevel0SSTable(m map[string]storageEntry) error {
 }
 
 func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageEntry) error {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	entries := make([]ssTableEntry, 0, len(keys))
+	for _, k := range keys {
+		v := m[k]
+		entries = append(entries, ssTableEntry{K: k, V: v.Value, Type: v.Type})
+	}
+	return sst.writeSortedSSTableFile(filePath, entries)
+}
+
+// writeSortedSSTableFile writes entries in key order. Callers must preserve
+// that ordering because the block index relies on sorted SSTable contents.
+func (sst *sstableStore) writeSortedSSTableFile(filePath string, entries []ssTableEntry) error {
 	dirPath := filepath.Dir(filePath)
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
 		return err
@@ -296,16 +326,6 @@ func (sst *sstableStore) writeSSTableFile(filePath string, m map[string]storageE
 		return err
 	}
 
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	entries := make([]ssTableEntry, 0, len(keys))
-	for _, k := range keys {
-		v := m[k]
-		entries = append(entries, ssTableEntry{K: k, V: v.Value, Type: v.Type})
-	}
 	if err := writeBlockBasedTable(f, entries); err != nil {
 		return err
 	}

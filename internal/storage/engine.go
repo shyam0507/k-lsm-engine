@@ -132,7 +132,7 @@ func (e *Engine) flushMemTableIfNeeded(count int) {
 	}
 
 	slog.Info("Flush threshold reached, calling SaveSSTable", "count", count)
-	err := e.ssTableStore.saveLevel0SSTable(e.memTable.getAll())
+	err := e.ssTableStore.saveLevel0SSTableEntries(e.memTable.entries())
 	if err != nil {
 		slog.Error("SaveSSTable failed", "error", err)
 		return

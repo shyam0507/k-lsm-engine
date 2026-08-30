@@ -47,12 +47,12 @@ func (mem *memTable) delete(key string) int {
 	return mem.kv.size
 }
 
-func (mem *memTable) getAll() map[string]storageEntry {
-	slog.Info("memTable getAll called")
+func (mem *memTable) entries() []ssTableEntry {
+	slog.Info("memTable entries called")
 	mem.mu.RLock()
 	defer mem.mu.RUnlock()
 
-	return mem.kv.getAllKeys()
+	return mem.kv.entries()
 }
 
 func (mem *memTable) size() int {
