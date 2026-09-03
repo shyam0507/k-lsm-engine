@@ -25,10 +25,12 @@ type ssTableEntry struct {
 	Type entryType `json:"type"` //not peristed on disk used in memory only
 }
 
+// struct used to hold information of each level of the sstable, every level will have this struct
 type sstableLevel struct {
-	tables    []string
-	keyRanges map[string]sstableKeyRange // populated for L1 tables
-	level     int
+	tables       []string
+	bloomFilters map[string]bloomFilter
+	keyRanges    map[string]sstableKeyRange // populated for L1 tables
+	level        int
 }
 
 // sstableKeyRange is inclusive. L1 tables are sorted and non-overlapping, so
@@ -37,6 +39,8 @@ type sstableKeyRange struct {
 	min string
 	max string
 }
+
+// represents the entire sstable including all the levels
 type sstableStore struct {
 	dir          string
 	manifestPath string
@@ -52,12 +56,61 @@ func newSSTableStore(dir string) *sstableStore {
 	}
 
 	levels = pruneLevelsFromDisk(dir, levels)
+	levels = loadBloomFilters(dir, levels)
 
 	return &sstableStore{
 		levels:       levels,
 		dir:          dir,
 		manifestPath: filepath.Join(dir, MANIFEST_FILE_NAME),
 	}
+}
+
+// load all the bloom filters into memory for the sstable
+func loadBloomFilters(dir string, levels []sstableLevel) []sstableLevel {
+	for i := range levels {
+		filters := make(map[string]bloomFilter, len(levels[i].tables))
+		for _, table := range levels[i].tables {
+			tablePath := filepath.Join(dir, fmt.Sprintf("l%d", levels[i].level), table)
+			filter, err := readBloomFilterSidecar(tablePath)
+			if err != nil {
+				slog.Warn("Bloom filter unavailable; falling back to SSTable read", "level", levels[i].level, "table", table, "error", err)
+				continue
+			}
+			filters[table] = filter
+		}
+		levels[i].bloomFilters = filters
+	}
+	return levels
+}
+
+// after flushing a sstable update the bloom filter in memory
+func (sst *sstableStore) registerBloomFilter(level int, table string) {
+	tablePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", level), table)
+	filter, err := readBloomFilterSidecar(tablePath)
+	if err != nil {
+		slog.Warn("Bloom filter unavailable; falling back to SSTable read", "level", level, "table", table, "error", err)
+		return
+	}
+	for i := range sst.levels {
+		if sst.levels[i].level != level {
+			continue
+		}
+		if sst.levels[i].bloomFilters == nil {
+			sst.levels[i].bloomFilters = make(map[string]bloomFilter)
+		}
+		sst.levels[i].bloomFilters[table] = filter
+		return
+	}
+}
+
+func removeSSTableAndBloom(tablePath string) error {
+	if err := os.Remove(tablePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(bloomSidecarPath(tablePath)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func pruneLevelsFromDisk(dir string, levels []sstableLevel) []sstableLevel {
@@ -71,9 +124,13 @@ func pruneLevelsFromDisk(dir string, levels []sstableLevel) []sstableLevel {
 				prunedTables = append(prunedTables, table)
 				continue
 			}
-			if !os.IsNotExist(statErr) {
-				slog.Warn("Skipping unreadable SSTable while rebuilding level state", "level", levelEntry.level, "table", table, "path", tablePath, "error", statErr)
+			if os.IsNotExist(statErr) {
+				if removeErr := os.Remove(bloomSidecarPath(tablePath)); removeErr != nil && !os.IsNotExist(removeErr) {
+					slog.Warn("Failed to remove orphaned bloom filter", "level", levelEntry.level, "table", table, "error", removeErr)
+				}
+				continue
 			}
+			slog.Warn("Skipping unreadable SSTable while rebuilding level state", "level", levelEntry.level, "table", table, "path", tablePath, "error", statErr)
 		}
 		prunedRanges := make(map[string]sstableKeyRange, len(prunedTables))
 		for _, table := range prunedTables {
@@ -257,6 +314,7 @@ func (sst *sstableStore) saveLevel0SSTableEntries(entries []ssTableEntry) error 
 	})
 }
 
+// save l0file and modify manifest
 func (sst *sstableStore) saveLevel0SSTableWithWriter(writeTable func(filePath string) error) error {
 	sst.mu.Lock()
 	defer sst.mu.Unlock()
@@ -276,12 +334,13 @@ func (sst *sstableStore) saveLevel0SSTableWithWriter(writeTable func(filePath st
 		Now modify the manifest file
 	*/
 	if err := sst.appendTableToManifestLocked(sstFileName, 0); err != nil {
-		if removeErr := os.Remove(filePath); removeErr != nil && !os.IsNotExist(removeErr) {
-			slog.Warn("Failed to remove unpublished SSTable", "file", filePath, "error", removeErr)
+		if removeErr := removeSSTableAndBloom(filePath); removeErr != nil {
+			slog.Warn("Failed to remove unpublished SSTable and bloom filter", "file", filePath, "error", removeErr)
 		}
 		slog.Error("Failed to append new table to manifest", "file", sst.manifestPath, "error", err)
 		return err
 	}
+	sst.registerBloomFilter(0, sstFileName)
 
 	slog.Info("SSTable written to disk with name", "name", sstFileName)
 	return nil
@@ -320,6 +379,7 @@ func (sst *sstableStore) writeSortedSSTableFile(filePath string, entries []ssTab
 		if !committed {
 			_ = f.Close()
 			_ = os.Remove(tempPath)
+			_ = os.Remove(bloomSidecarPath(filePath))
 		}
 	}()
 	if err := f.Chmod(0644); err != nil {
@@ -336,6 +396,9 @@ func (sst *sstableStore) writeSortedSSTableFile(filePath string, entries []ssTab
 
 	if err := f.Close(); err != nil {
 		slog.Error("Failed to close new sstable file after write", "file", filePath, "error", err)
+		return err
+	}
+	if err := writeBloomFilterSidecar(filePath, bloomFilterForEntries(entries)); err != nil {
 		return err
 	}
 
@@ -459,6 +522,7 @@ func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 	for level := 0; level < MAX_LEVELS; level++ {
 		levelTables := sst.getLevelSSTablesLocked(level)
 		var keyRanges map[string]sstableKeyRange
+		var bloomFilters map[string]bloomFilter
 		if level == 1 {
 			for _, levelEntry := range sst.levels {
 				if levelEntry.level == level {
@@ -467,9 +531,18 @@ func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 				}
 			}
 		}
+		for _, levelEntry := range sst.levels {
+			if levelEntry.level == level {
+				bloomFilters = levelEntry.bloomFilters
+				break
+			}
+		}
 		for i := len(levelTables) - 1; i >= 0; i-- {
 			v := levelTables[i]
 			if keyRange, ok := keyRanges[v]; !l1TableMayContain(key, keyRange, ok) {
+				continue
+			}
+			if filter, ok := bloomFilters[v]; ok && !filter.found(key) {
 				continue
 			}
 			tablePath := filepath.Join(sst.dir, fmt.Sprintf("l%d", level), v)

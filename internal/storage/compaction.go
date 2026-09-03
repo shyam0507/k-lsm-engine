@@ -104,6 +104,9 @@ func (sst *sstableStore) pruneLevelTables(level int, tables []string) []string {
 			slog.Warn("Skipping unreadable SSTable while pruning level state", "level", level, "table", table, "path", tablePath, "error", statErr)
 			continue
 		}
+		if removeErr := os.Remove(bloomSidecarPath(tablePath)); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("Failed to remove orphaned bloom filter", "level", level, "table", table, "error", removeErr)
+		}
 
 		slog.Warn("Removing missing SSTable from manifest state", "level", level, "table", table, "path", tablePath)
 	}
@@ -144,6 +147,7 @@ func (sst *sstableStore) compactSSTables() error {
 			prunedLevels = append(prunedLevels, existing)
 		}
 	}
+	prunedLevels = loadBloomFilters(sst.dir, prunedLevels)
 
 	l0Tables := getTablesForLevel(prunedLevels, 0)
 	if len(l0Tables) < 2 {
@@ -218,8 +222,8 @@ func (sst *sstableStore) compactSSTables() error {
 			return
 		}
 		for _, table := range newTables {
-			if err := os.Remove(filepath.Join(sst.dir, "l1", table)); err != nil && !os.IsNotExist(err) {
-				slog.Warn("Failed to remove unpublished compacted SSTable", "table", table, "error", err)
+			if err := removeSSTableAndBloom(filepath.Join(sst.dir, "l1", table)); err != nil {
+				slog.Warn("Failed to remove unpublished compacted SSTable and bloom filter", "table", table, "error", err)
 			}
 		}
 	}()
@@ -326,6 +330,7 @@ func (sst *sstableStore) compactSSTables() error {
 	sort.Slice(levels, func(i, j int) bool {
 		return levels[i].level < levels[j].level
 	})
+	levels = loadBloomFilters(sst.dir, levels)
 
 	if err := sst.rewriteManifestFromLevels(levels); err != nil {
 		return err
@@ -335,14 +340,14 @@ func (sst *sstableStore) compactSSTables() error {
 	published = true
 
 	for _, table := range oldTablesLevel0 {
-		if err := os.Remove(filepath.Join(sst.dir, "l0", table)); err != nil && !os.IsNotExist(err) {
-			slog.Error("Failed to remove old SSTable from level 0 after compaction", "table", table, "error", err)
+		if err := removeSSTableAndBloom(filepath.Join(sst.dir, "l0", table)); err != nil {
+			slog.Error("Failed to remove old SSTable and bloom filter from level 0 after compaction", "table", table, "error", err)
 		}
 	}
 
 	for _, table := range oldTablesLevel1 {
-		if err := os.Remove(filepath.Join(sst.dir, "l1", table)); err != nil && !os.IsNotExist(err) {
-			slog.Error("Failed to remove old SSTable from level 1 after compaction", "table", table, "error", err)
+		if err := removeSSTableAndBloom(filepath.Join(sst.dir, "l1", table)); err != nil {
+			slog.Error("Failed to remove old SSTable and bloom filter from level 1 after compaction", "table", table, "error", err)
 		}
 	}
 
