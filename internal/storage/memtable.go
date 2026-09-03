@@ -2,19 +2,18 @@ package storage
 
 import (
 	"log/slog"
-	"maps"
 	"sync"
 )
 
 type memTable struct {
-	kv map[string]storageEntry
+	kv skipList
 	mu sync.RWMutex
 }
 
 func newMemTable() *memTable {
 	slog.Info("Creating new memTable instance")
 	return &memTable{
-		kv: make(map[string]storageEntry),
+		kv: *newSkipList(),
 	}
 }
 
@@ -23,7 +22,7 @@ func (mem *memTable) get(key string) (storageEntry, bool) {
 	mem.mu.RLock()
 	defer mem.mu.RUnlock()
 
-	entry, ok := mem.kv[key]
+	entry, ok := mem.kv.get(key)
 	return entry, ok
 }
 
@@ -32,14 +31,11 @@ func (mem *memTable) put(key, value string) int {
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
 
-	mem.kv[key] = storageEntry{
+	mem.kv.add(key, storageEntry{
 		Type:  entryTypePut,
 		Value: value,
-	}
-
-	size := len(mem.kv)
-
-	return size
+	})
+	return mem.kv.size
 }
 
 func (mem *memTable) delete(key string) int {
@@ -47,28 +43,23 @@ func (mem *memTable) delete(key string) int {
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
 
-	mem.kv[key] = storageEntry{
-		Type: entryTypeDelete,
-	}
-
-	return len(mem.kv)
+	mem.kv.add(key, storageEntry{Type: entryTypeDelete})
+	return mem.kv.size
 }
 
-func (mem *memTable) getAll() map[string]storageEntry {
-	slog.Info("memTable getAll called")
+func (mem *memTable) entries() []ssTableEntry {
+	slog.Info("memTable entries called")
 	mem.mu.RLock()
 	defer mem.mu.RUnlock()
 
-	result := make(map[string]storageEntry)
-	maps.Copy(result, mem.kv)
-	return result
+	return mem.kv.entries()
 }
 
 func (mem *memTable) size() int {
 	mem.mu.RLock()
 	defer mem.mu.RUnlock()
 
-	return len(mem.kv)
+	return mem.kv.size
 }
 
 func (mem *memTable) clear() {
@@ -76,5 +67,5 @@ func (mem *memTable) clear() {
 	mem.mu.Lock()
 	defer mem.mu.Unlock()
 
-	clear(mem.kv)
+	mem.kv.clear()
 }
