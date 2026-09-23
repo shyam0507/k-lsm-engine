@@ -28,13 +28,13 @@ type walPayload struct {
 	Value string    `json:"value"`
 }
 
-func newWAL(dir string) *wal {
+func newWAL(dir string, num int) *wal {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Fatal("Failed to create WAL directory", err)
 	}
 
 	return &wal{
-		path: filepath.Join(dir, walFileName),
+		path: filepath.Join(dir, fmt.Sprintf("%s%d%s", walFilePrefix, num, dbFileExt)),
 	}
 }
 

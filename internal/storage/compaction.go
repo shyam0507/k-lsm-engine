@@ -243,7 +243,7 @@ func (sst *sstableStore) compactSSTables() error {
 
 		var newTableName, newFilePath string
 		for {
-			newTableName = fmt.Sprintf("%s%d%s", ssTablePrefix, nextL1Index, ssTableExt)
+			newTableName = fmt.Sprintf("%s%d%s", ssTablePrefix, nextL1Index, dbFileExt)
 			nextL1Index++
 			newFilePath = filepath.Join(sst.dir, "l1", newTableName)
 			_, err := os.Stat(newFilePath)

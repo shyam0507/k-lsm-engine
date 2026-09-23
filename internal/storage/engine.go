@@ -3,6 +3,7 @@ package storage
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -11,22 +12,47 @@ const (
 	MAX_LEVELS           = 2
 )
 
+// a catalog holds reference to memtable, wal etc and their active readers so that compaction/flush can run in background and once the refCount becomes 0 and a new Catalog is available references can be GC
+type Catalog struct {
+	memtable     *memTable
+	walPath      string
+	manifestPath string
+	version      atomic.Int64
+	refCount     atomic.Int64
+}
+
 type Engine struct {
 	memTable     *memTable
 	wal          *wal
 	ssTableStore *sstableStore
 
 	writeMu sync.Mutex
+
+	activeCatalog *Catalog
+	catalogs      []*Catalog
 }
 
 func NewEngine() *Engine {
 	slog.Info("Creating new Engine instance")
 
+	mt := newMemTable()
+	//TODO read the pending wal and then decide the number
+	wal := newWAL(walDirPath(), 1)
+	store := newSSTableStore(sstableDirPath())
+
+	catalog := &Catalog{
+		memtable:     mt,
+		walPath:      wal.path,
+		manifestPath: store.manifestPath,
+	}
+	catalog.version.Store(1)
+
 	e := &Engine{
-		memTable:     newMemTable(),
-		wal:          newWAL(walDirPath()),
-		ssTableStore: newSSTableStore(sstableDirPath()),
-		writeMu:      sync.Mutex{},
+		memTable:      mt,
+		wal:           wal,
+		ssTableStore:  store,
+		writeMu:       sync.Mutex{},
+		activeCatalog: catalog,
 	}
 
 	//load the wal into memory

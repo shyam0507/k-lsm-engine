@@ -211,11 +211,11 @@ func parseManifestTable(line string, level int) (string, sstableKeyRange, bool, 
 }
 
 func getSSTableIndex(table string) int {
-	if !strings.HasPrefix(table, ssTablePrefix) || !strings.HasSuffix(table, ssTableExt) {
+	if !strings.HasPrefix(table, ssTablePrefix) || !strings.HasSuffix(table, dbFileExt) {
 		return 0
 	}
 
-	numPart := strings.TrimSuffix(strings.TrimPrefix(table, ssTablePrefix), ssTableExt)
+	numPart := strings.TrimSuffix(strings.TrimPrefix(table, ssTablePrefix), dbFileExt)
 	idx, err := strconv.Atoi(numPart)
 	if err != nil || idx <= 0 {
 		return 0
@@ -242,7 +242,7 @@ func (sst *sstableStore) getNewSSTableName(level int) string {
 			break
 		}
 	}
-	return fmt.Sprintf("%s%d%s", ssTablePrefix, count, ssTableExt)
+	return fmt.Sprintf("%s%d%s", ssTablePrefix, count, dbFileExt)
 }
 
 // saves ss table to level 0
