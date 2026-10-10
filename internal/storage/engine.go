@@ -2,7 +2,9 @@ package storage
 
 import (
 	"log/slog"
+	"strconv"
 	"sync"
+	"time"
 )
 
 const (
@@ -57,36 +59,48 @@ func NewEngine() *Engine {
 		}
 	}
 
+	memtableEntries.Set(float64(e.memTable.size()))
+	e.updateSSTableGauges()
+
 	return e
 }
 
 func (e *Engine) Get(key string) (string, bool) {
 	slog.Info("Get called", "key", key)
 
+	start := time.Now()
 	entry, ok := e.memTable.get(key)
+	observeStage("get", "memtable_read", start)
 
 	if ok {
 		if entry.Type == entryTypeDelete {
 			slog.Info("Key deleted in Mem Table", "key", key)
+			getSource.WithLabelValues("tombstone").Inc()
 			return "", false
 		}
 
 		slog.Info("Key found in Mem Table", "key", key, "value", entry.Value)
+		getSource.WithLabelValues("memtable").Inc()
 		return entry.Value, true
 	}
 
 	// Get data from sstable
+	start = time.Now()
 	entry, ok = e.ssTableStore.getKey(key)
+	observeStage("get", "sstable_read", start)
 	if ok {
 		if entry.Type == entryTypeDelete {
 			slog.Info("Key deleted in ss table", "key", key)
+			getSource.WithLabelValues("tombstone").Inc()
 			return "", false
 		}
 
 		slog.Info("Key found in ss table", "key", key, "value", entry.Value)
+		getSource.WithLabelValues("sstable").Inc()
 		return entry.Value, true
 	}
 
+	getSource.WithLabelValues("not_found").Inc()
 	return "", false
 }
 
@@ -100,16 +114,25 @@ func (e *Engine) Put(key, value string) {
 	}
 
 	//Lock to make sure that write to wal and mem table happen serially (Important for same file update)
+	start := time.Now()
 	e.writeMu.Lock()
+	observeStage("put", "lock_wait", start)
 	defer e.writeMu.Unlock()
 
-	if err := e.wal.append(entry); err != nil {
+	start = time.Now()
+	err = e.wal.append(entry)
+	observeStage("put", "wal_append", start)
+	if err != nil {
 		slog.Error("Failed to append WAL entry", "key", key, "error", err)
 		return
 	}
 
+	start = time.Now()
 	count := e.memTable.put(key, value)
-	e.flushMemTableIfNeeded(count)
+	observeStage("put", "memtable_write", start)
+	memtableEntries.Set(float64(count))
+
+	e.flushMemTableIfNeeded("put", count)
 
 	slog.Info("Key inserted/updated", "key", key)
 }
@@ -118,7 +141,9 @@ func (e *Engine) Delete(key string) {
 	slog.Info("Delete called", "key", key)
 
 	//Lock to make sure that write to wal and mem table happen serially (Important for same file update)
+	start := time.Now()
 	e.writeMu.Lock()
+	observeStage("delete", "lock_wait", start)
 	defer e.writeMu.Unlock()
 
 	entry, err := newWALEntry(key, "", entryTypeDelete)
@@ -126,34 +151,55 @@ func (e *Engine) Delete(key string) {
 		slog.Error("Failed to create WAL entry", "key", key, "error", err)
 		return
 	}
-	if err := e.wal.append(entry); err != nil {
+
+	start = time.Now()
+	err = e.wal.append(entry)
+	observeStage("delete", "wal_append", start)
+	if err != nil {
 		slog.Error("Failed to append WAL entry", "key", key, "error", err)
 		return
 	}
 
+	start = time.Now()
 	count := e.memTable.delete(key)
-	e.flushMemTableIfNeeded(count)
+	observeStage("delete", "memtable_write", start)
+	memtableEntries.Set(float64(count))
+
+	e.flushMemTableIfNeeded("delete", count)
 }
 
-func (e *Engine) flushMemTableIfNeeded(count int) {
+// flushMemTableIfNeeded flushes the memtable when count hits FLUSH_THRESHOLD.
+// op is the caller's operation label so the flush shows up as a stage of that request.
+func (e *Engine) flushMemTableIfNeeded(op string, count int) {
 	if count != FLUSH_THRESHOLD {
 		return
 	}
 
+	flushStart := time.Now()
+	defer observeStage(op, "flush", flushStart)
+	flushTotal.Inc()
+
 	slog.Info("Flush threshold reached, calling SaveSSTable", "count", count)
+	start := time.Now()
 	err := e.ssTableStore.saveLevel0SSTable(e.memTable.getAll())
+	observeStage("flush", "sstable_write", start)
 	if err != nil {
 		slog.Error("SaveSSTable failed", "error", err)
 		return
 	}
 
-	if err := e.wal.truncate(); err != nil {
+	start = time.Now()
+	err = e.wal.truncate()
+	observeStage("flush", "wal_truncate", start)
+	if err != nil {
 		//TODO stop server (recovery)?
 		slog.Error("Error while deleting the wal file", "error", err)
 		return
 	}
 
 	e.memTable.clear()
+	memtableEntries.Set(0)
+	e.updateSSTableGauges()
 	slog.Info("SaveSSTable succeeded, clearing in-memory map")
 
 	e.maybeCompactIfNeeded()
@@ -166,7 +212,18 @@ func (e *Engine) maybeCompactIfNeeded() {
 	}
 
 	slog.Info("Compaction threshold reached, starting SSTable compaction", "count", len(e.ssTableStore.getLevelSSTables(0)))
-	if err := e.ssTableStore.compactSSTables(); err != nil {
+	compactionTotal.Inc()
+	start := time.Now()
+	err := e.ssTableStore.compactSSTables()
+	observeStage("compact", "total", start)
+	if err != nil {
 		slog.Error("SSTable compaction failed", "error", err)
+	}
+	e.updateSSTableGauges()
+}
+
+func (e *Engine) updateSSTableGauges() {
+	for level := 0; level < MAX_LEVELS; level++ {
+		sstablesPerLevel.WithLabelValues(strconv.Itoa(level)).Set(float64(len(e.ssTableStore.getLevelSSTables(level))))
 	}
 }

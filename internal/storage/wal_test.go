@@ -49,7 +49,7 @@ func TestDifferentPayloadsHaveDifferentCRCs(t *testing.T) {
 }
 
 func TestWALGetAllReadsAppendedEntries(t *testing.T) {
-	w := newWAL(t.TempDir())
+	w := newWAL(t.TempDir(), 1)
 
 	putEntry, err := newWALEntry("key", "value", entryTypePut)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestWALGetAllReadsAppendedEntries(t *testing.T) {
 }
 
 func TestWALGetAllCreatesMissingFile(t *testing.T) {
-	w := newWAL(t.TempDir())
+	w := newWAL(t.TempDir(), 1)
 
 	entries, err := w.getAll()
 	if err != nil {
@@ -96,7 +96,7 @@ func TestWALGetAllCreatesMissingFile(t *testing.T) {
 }
 
 func TestWALGetAllRejectsInvalidCRC(t *testing.T) {
-	w := newWAL(t.TempDir())
+	w := newWAL(t.TempDir(), 1)
 
 	data := []byte(`{"crc":"invalid","key":"key","type":"PUT","value":"value"}` + "\n")
 	if err := os.WriteFile(w.path, data, 0644); err != nil {
@@ -105,5 +105,56 @@ func TestWALGetAllRejectsInvalidCRC(t *testing.T) {
 
 	if _, err := w.getAll(); err == nil {
 		t.Fatal("expected invalid crc error")
+	}
+}
+
+func TestWALAppendAfterTruncate(t *testing.T) {
+	w := newWAL(t.TempDir(), 1)
+
+	first, err := newWALEntry("first", "1", entryTypePut)
+	if err != nil {
+		t.Fatalf("new wal entry: %v", err)
+	}
+	if err := w.append(first); err != nil {
+		t.Fatalf("append first entry: %v", err)
+	}
+
+	if err := w.truncate(); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	second, err := newWALEntry("second", "2", entryTypePut)
+	if err != nil {
+		t.Fatalf("new wal entry: %v", err)
+	}
+	if err := w.append(second); err != nil {
+		t.Fatalf("append second entry: %v", err)
+	}
+
+	entries, err := w.getAll()
+	if err != nil {
+		t.Fatalf("get all wal entries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 wal entry after truncate, got %d", len(entries))
+	}
+	if entries[0] != (walPayload{Key: "second", Type: entryTypePut, Value: "2"}) {
+		t.Fatalf("unexpected wal entry after truncate: %#v", entries[0])
+	}
+}
+
+func BenchmarkWALAppend(b *testing.B) {
+	w := newWAL(b.TempDir(), 1)
+
+	entry, err := newWALEntry("key", "value", entryTypePut)
+	if err != nil {
+		b.Fatalf("new wal entry: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := w.append(entry); err != nil {
+			b.Fatalf("append: %v", err)
+		}
 	}
 }

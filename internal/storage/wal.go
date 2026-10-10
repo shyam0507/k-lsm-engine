@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type wal struct {
 	path string
+	f    *os.File
 }
 
 type walEntry struct {
@@ -33,8 +35,23 @@ func newWAL(dir string, num int) *wal {
 		log.Fatal("Failed to create WAL directory", err)
 	}
 
+	path := filepath.Join(dir, fmt.Sprintf("%s%d%s", walFilePrefix, num, dbFileExt))
+
+	// Keep one fd open for the life of the WAL: appends then cost a single fsync
+	// instead of open + fsync + close + directory fsync.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal("Failed to open WAL file", err)
+	}
+
+	// The directory entry only needs to be durable once, when the file is created.
+	if err := syncParentDir(path); err != nil {
+		log.Fatal("Failed to fsync WAL directory", err)
+	}
+
 	return &wal{
-		path: filepath.Join(dir, fmt.Sprintf("%s%d%s", walFilePrefix, num, dbFileExt)),
+		path: path,
+		f:    f,
 	}
 }
 
@@ -70,56 +87,30 @@ func calculateCRC(payload walPayload) (string, error) {
 
 // append an entry to WAL
 func (w *wal) append(e *walEntry) error {
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
-		return err
-	}
-
-	err = json.NewEncoder(f).Encode(e)
-	if err != nil {
-		f.Close()
+	if err := json.NewEncoder(w.f).Encode(e); err != nil {
 		slog.Error("Failed to write entry to WAL", "file", w.path, "error", err)
 		return err
 	}
 
-	if err := f.Sync(); err != nil {
-		f.Close()
+	syncStart := time.Now()
+	if err := w.f.Sync(); err != nil {
 		slog.Error("Failed to fsync the wal", "error", err)
 		return err
 	}
-
-	if err := f.Close(); err != nil {
-		slog.Error("Failed to close WAL file after write", "file", w.path, "error", err)
-		return err
-	}
-
-	if err := syncParentDir(w.path); err != nil {
-		slog.Error("Failed to fsync WAL parent directory", "dir", filepath.Dir(w.path), "error", err)
-		return err
-	}
+	observeStage("write", "wal_fsync", syncStart)
 
 	return nil
 }
 
 func (w *wal) truncate() error {
-	f, err := os.OpenFile(w.path, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0644)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		slog.Error("Failed to open WAL file for writing", "file", w.path, "error", err)
+	// The fd is O_APPEND, so the next write lands at the new end (offset 0).
+	if err := w.f.Truncate(0); err != nil {
+		slog.Error("Failed to truncate the wal", "file", w.path, "error", err)
 		return err
 	}
 
-	if err := f.Sync(); err != nil {
-		f.Close()
+	if err := w.f.Sync(); err != nil {
 		slog.Error("Failed to fsync the wal on truncate", "error", err)
-		return err
-	}
-
-	if err := f.Close(); err != nil {
-		slog.Error("Failed to close WAL file after truncate", "file", w.path, "error", err)
 		return err
 	}
 

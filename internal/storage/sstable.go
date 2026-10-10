@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -438,7 +439,9 @@ func (sst *sstableStore) appendTableToManifestLocked(table string, level int) er
 }
 
 func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
+	lockStart := time.Now()
 	sst.mu.RLock()
+	observeStage("get", "sstable_lock_wait", lockStart)
 	defer sst.mu.RUnlock()
 
 	for level := 0; level < MAX_LEVELS; level++ {
@@ -462,6 +465,7 @@ func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 				slog.Error("Error while reading the ss table", "file", v, "error", err)
 				continue
 			}
+			sstableFilesScanned.Inc()
 
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {

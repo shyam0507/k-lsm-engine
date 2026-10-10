@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
+	"os"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -67,7 +69,12 @@ func main() {
 
 	http.Handle("/metrics", promhttp.Handler())
 
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	addr := os.Getenv("KLSM_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal("error while running the server: ", err)
 	}
 }
