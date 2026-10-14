@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -266,11 +267,11 @@ func parseManifestTable(line string, level int) (string, sstableKeyRange, bool, 
 }
 
 func getSSTableIndex(table string) int {
-	if !strings.HasPrefix(table, ssTablePrefix) || !strings.HasSuffix(table, ssTableExt) {
+	if !strings.HasPrefix(table, ssTablePrefix) || !strings.HasSuffix(table, dbFileExt) {
 		return 0
 	}
 
-	numPart := strings.TrimSuffix(strings.TrimPrefix(table, ssTablePrefix), ssTableExt)
+	numPart := strings.TrimSuffix(strings.TrimPrefix(table, ssTablePrefix), dbFileExt)
 	idx, err := strconv.Atoi(numPart)
 	if err != nil || idx <= 0 {
 		return 0
@@ -297,7 +298,7 @@ func (sst *sstableStore) getNewSSTableName(level int) string {
 			break
 		}
 	}
-	return fmt.Sprintf("%s%d%s", ssTablePrefix, count, ssTableExt)
+	return fmt.Sprintf("%s%d%s", ssTablePrefix, count, dbFileExt)
 }
 
 // saves ss table to level 0
@@ -516,7 +517,9 @@ func (sst *sstableStore) appendTableToManifestLocked(table string, level int) er
 }
 
 func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
+	lockStart := time.Now()
 	sst.mu.RLock()
+	observeStage("get", "sstable_lock_wait", lockStart)
 	defer sst.mu.RUnlock()
 
 	for level := 0; level < MAX_LEVELS; level++ {
@@ -551,6 +554,7 @@ func (sst *sstableStore) getKey(key string) (storageEntry, bool) {
 				slog.Error("Error while opening block-based SSTable", "file", v, "error", err)
 				continue
 			}
+			sstableFilesScanned.Inc()
 			entry, found, err := table.get(key)
 			closeErr := table.close()
 			if err != nil {

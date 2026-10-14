@@ -8,9 +8,9 @@ const (
 	walDirName     = "wal"
 	sstableDirName = "sstable"
 
-	walFileName   = "wal.db"
+	walFilePrefix = "wal-"
 	ssTablePrefix = "sst-"
-	ssTableExt    = ".db"
+	dbFileExt     = ".db"
 )
 
 func rootDirPath() string {

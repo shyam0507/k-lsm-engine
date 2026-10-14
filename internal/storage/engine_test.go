@@ -10,7 +10,7 @@ func newTestEngine(t *testing.T) *Engine {
 
 	return &Engine{
 		memTable:     newMemTable(),
-		wal:          newWAL(t.TempDir()),
+		wal:          newWAL(t.TempDir(), 1),
 		ssTableStore: newSSTableStore(t.TempDir()),
 	}
 }
@@ -45,7 +45,7 @@ func TestSSTableTombstoneHidesOlderValue(t *testing.T) {
 
 	engine := &Engine{
 		memTable:     newMemTable(),
-		wal:          newWAL(t.TempDir()),
+		wal:          newWAL(t.TempDir(), 1),
 		ssTableStore: sst,
 	}
 
