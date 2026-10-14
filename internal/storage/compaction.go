@@ -1,66 +1,62 @@
 package storage
 
 import (
-	"bufio"
 	"container/heap"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 type sstableReader struct {
-	file    *os.File
-	scanner *bufio.Scanner
+	table   *blockBasedTable
+	block   int
+	entries []ssTableEntry
+	entryAt int
 	entry   ssTableEntry
 	hasNext bool
 	path    string
 }
 
 func newSSTableReader(path string) (*sstableReader, error) {
-	f, err := os.Open(path)
+	table, err := openBlockBasedTable(path)
 	if err != nil {
 		return nil, err
 	}
 
 	r := &sstableReader{
-		file:    f,
-		scanner: bufio.NewScanner(f),
-		path:    path,
+		table: table,
+		path:  path,
 	}
 	return r, nil
 }
 
 func (r *sstableReader) advance() error {
-	for r.scanner.Scan() {
-		line := strings.TrimSpace(r.scanner.Text())
-		if line == "" {
-			continue
+	for r.block < len(r.table.index) {
+		if r.entries == nil {
+			entries, err := r.table.readBlock(r.block)
+			if err != nil {
+				return fmt.Errorf("decode SSTable block in %s: %w", r.path, err)
+			}
+			r.entries = entries
+			r.entryAt = 0
 		}
-
-		var entry ssTableEntry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			return fmt.Errorf("decode SSTable entry in %s: %w", r.path, err)
+		if r.entryAt < len(r.entries) {
+			r.entry = r.entries[r.entryAt]
+			r.entryAt++
+			r.hasNext = true
+			return nil
 		}
-
-		r.entry = entry
-		r.hasNext = true
-		return nil
+		r.block++
+		r.entries = nil
 	}
-
-	if err := r.scanner.Err(); err != nil {
-		return err
-	}
-
 	r.hasNext = false
 	return nil
 }
 
 func (r *sstableReader) close() error {
-	return r.file.Close()
+	return r.table.close()
 }
 
 type sstableHeapItem struct {
@@ -108,6 +104,9 @@ func (sst *sstableStore) pruneLevelTables(level int, tables []string) []string {
 			slog.Warn("Skipping unreadable SSTable while pruning level state", "level", level, "table", table, "path", tablePath, "error", statErr)
 			continue
 		}
+		if removeErr := os.Remove(bloomSidecarPath(tablePath)); removeErr != nil && !os.IsNotExist(removeErr) {
+			slog.Warn("Failed to remove orphaned bloom filter", "level", level, "table", table, "error", removeErr)
+		}
 
 		slog.Warn("Removing missing SSTable from manifest state", "level", level, "table", table, "path", tablePath)
 	}
@@ -148,6 +147,7 @@ func (sst *sstableStore) compactSSTables() error {
 			prunedLevels = append(prunedLevels, existing)
 		}
 	}
+	prunedLevels = loadBloomFilters(sst.dir, prunedLevels)
 
 	l0Tables := getTablesForLevel(prunedLevels, 0)
 	if len(l0Tables) < 2 {
@@ -222,12 +222,14 @@ func (sst *sstableStore) compactSSTables() error {
 			return
 		}
 		for _, table := range newTables {
-			if err := os.Remove(filepath.Join(sst.dir, "l1", table)); err != nil && !os.IsNotExist(err) {
-				slog.Warn("Failed to remove unpublished compacted SSTable", "table", table, "error", err)
+			if err := removeSSTableAndBloom(filepath.Join(sst.dir, "l1", table)); err != nil {
+				slog.Warn("Failed to remove unpublished compacted SSTable and bloom filter", "table", table, "error", err)
 			}
 		}
 	}()
-	chunk := make(map[string]storageEntry, FLUSH_THRESHOLD)
+	// The merge heap emits keys in ascending order, so chunks are already
+	// sorted and can be written without converting through a map or sorting.
+	chunk := make([]ssTableEntry, 0, FLUSH_THRESHOLD)
 	chunkCount := 0
 	chunkMinKey := ""
 	chunkMaxKey := ""
@@ -254,13 +256,13 @@ func (sst *sstableStore) compactSSTables() error {
 				return err
 			}
 		}
-		if err := sst.writeSSTableFile(newFilePath, chunk); err != nil {
+		if err := sst.writeSortedSSTableFile(newFilePath, chunk); err != nil {
 			return err
 		}
 
 		newTables = append(newTables, newTableName)
 		newTableRanges[newTableName] = sstableKeyRange{min: chunkMinKey, max: chunkMaxKey}
-		chunk = make(map[string]storageEntry, FLUSH_THRESHOLD)
+		chunk = make([]ssTableEntry, 0, FLUSH_THRESHOLD)
 		chunkCount = 0
 		chunkMinKey = ""
 		chunkMaxKey = ""
@@ -278,7 +280,7 @@ func (sst *sstableStore) compactSSTables() error {
 				}
 			}
 
-			chunk[item.key] = item.entry
+			chunk = append(chunk, ssTableEntry{K: item.key, V: item.entry.Value, Type: item.entry.Type})
 			chunkCount++
 			if chunkCount == 1 {
 				chunkMinKey = item.key
@@ -328,6 +330,7 @@ func (sst *sstableStore) compactSSTables() error {
 	sort.Slice(levels, func(i, j int) bool {
 		return levels[i].level < levels[j].level
 	})
+	levels = loadBloomFilters(sst.dir, levels)
 
 	if err := sst.rewriteManifestFromLevels(levels); err != nil {
 		return err
@@ -337,14 +340,14 @@ func (sst *sstableStore) compactSSTables() error {
 	published = true
 
 	for _, table := range oldTablesLevel0 {
-		if err := os.Remove(filepath.Join(sst.dir, "l0", table)); err != nil && !os.IsNotExist(err) {
-			slog.Error("Failed to remove old SSTable from level 0 after compaction", "table", table, "error", err)
+		if err := removeSSTableAndBloom(filepath.Join(sst.dir, "l0", table)); err != nil {
+			slog.Error("Failed to remove old SSTable and bloom filter from level 0 after compaction", "table", table, "error", err)
 		}
 	}
 
 	for _, table := range oldTablesLevel1 {
-		if err := os.Remove(filepath.Join(sst.dir, "l1", table)); err != nil && !os.IsNotExist(err) {
-			slog.Error("Failed to remove old SSTable from level 1 after compaction", "table", table, "error", err)
+		if err := removeSSTableAndBloom(filepath.Join(sst.dir, "l1", table)); err != nil {
+			slog.Error("Failed to remove old SSTable and bloom filter from level 1 after compaction", "table", table, "error", err)
 		}
 	}
 

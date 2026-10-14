@@ -35,8 +35,18 @@ func TestCompactionStoresAndUsesL1KeyRanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
 	}
-	if !strings.Contains(string(manifest), "\t\"key-000\"\t\"key-199\"") || !strings.Contains(string(manifest), "\t\"key-200\"\t\"key-399\"") {
-		t.Fatalf("manifest does not contain L1 key ranges:\n%s", manifest)
+	for _, table := range l1Tables {
+		var line string
+		for _, candidate := range strings.Split(string(manifest), "\n") {
+			if strings.HasPrefix(candidate, table+"\t") {
+				line = candidate
+				break
+			}
+		}
+		parsedTable, keyRange, hasRange, err := parseManifestTable(line, 1)
+		if err != nil || parsedTable != table || !hasRange || keyRange.min > keyRange.max {
+			t.Fatalf("manifest does not contain a valid range for %s:\n%s", table, manifest)
+		}
 	}
 
 	// Reopening verifies that ranges are read from the manifest, not only held

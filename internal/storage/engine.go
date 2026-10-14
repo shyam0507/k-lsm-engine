@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	FLUSH_THRESHOLD      = 2000
+	FLUSH_THRESHOLD      = sstableMaxEntries
 	COMPACTION_THRESHOLD = 5 //compact when number of tables are met
 	MAX_LEVELS           = 2
 )
@@ -181,7 +181,7 @@ func (e *Engine) flushMemTableIfNeeded(op string, count int) {
 
 	slog.Info("Flush threshold reached, calling SaveSSTable", "count", count)
 	start := time.Now()
-	err := e.ssTableStore.saveLevel0SSTable(e.memTable.getAll())
+	err := e.ssTableStore.saveLevel0SSTableEntries(e.memTable.entries())
 	observeStage("flush", "sstable_write", start)
 	if err != nil {
 		slog.Error("SaveSSTable failed", "error", err)

@@ -2,7 +2,10 @@ module github.com/shyam0507/k-lsm-engine
 
 go 1.24.5
 
-require github.com/prometheus/client_golang v1.23.2
+require (
+	github.com/prometheus/client_golang v1.23.2
+	github.com/spaolacci/murmur3 v1.1.0
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
