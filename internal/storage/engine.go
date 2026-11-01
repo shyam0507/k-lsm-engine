@@ -18,7 +18,8 @@ type Engine struct {
 	wal          *wal
 	ssTableStore *sstableStore
 
-	writeMu sync.Mutex
+	writeMu   sync.Mutex
+	catalogMu sync.Mutex
 
 	activeCatalog  *Catalog
 	catalogManager *CatalogManager
@@ -39,6 +40,7 @@ func NewEngine() *Engine {
 		writeMu:        sync.Mutex{},
 		catalogManager: newCatalogManager(),
 	}
+	e.ensureCatalog()
 
 	//load the wal into memory
 	entries, err := e.wal.getAll()
@@ -68,8 +70,11 @@ func NewEngine() *Engine {
 func (e *Engine) Get(key string) (string, bool) {
 	slog.Info("Get called", "key", key)
 
+	catalog := e.PinCatalog()
+	defer e.ReleaseCatalog(catalog)
+
 	start := time.Now()
-	entry, ok := e.memTable.get(key)
+	entry, ok := getFromCatalog(catalog, e.memTable, key)
 	observeStage("get", "memtable_read", start)
 
 	if ok {
@@ -104,8 +109,55 @@ func (e *Engine) Get(key string) (string, bool) {
 	return "", false
 }
 
+// PinCatalog holds the current catalog for the duration of an application
+// request. Embedded callers can defer ReleaseCatalog around a group of reads.
+func (e *Engine) PinCatalog() *Catalog {
+	e.ensureCatalog()
+	return e.catalogManager.AcquireCatalog()
+}
+
+// ReleaseCatalog releases a catalog previously returned by PinCatalog.
+func (e *Engine) ReleaseCatalog(catalog *Catalog) {
+	if e.catalogManager != nil {
+		e.catalogManager.ReleaseCatalog(catalog)
+	}
+}
+
+// ensureCatalog makes zero-value and test-created engines usable, while normal
+// engines initialize their first catalog during construction.
+func (e *Engine) ensureCatalog() {
+	e.catalogMu.Lock()
+	defer e.catalogMu.Unlock()
+	if e.catalogManager == nil {
+		e.catalogManager = newCatalogManager()
+	}
+	if catalog := e.catalogManager.AcquireCatalog(); catalog != nil {
+		e.catalogManager.ReleaseCatalog(catalog)
+		return
+	}
+	walPath := ""
+	if e.wal != nil {
+		walPath = e.wal.path
+	}
+	e.catalogManager.NewCatalog([]*memTable{e.memTable}, []string{walPath}, "")
+}
+
+func getFromCatalog(catalog *Catalog, fallback *memTable, key string) (storageEntry, bool) {
+	if catalog == nil || len(catalog.memtables) == 0 {
+		return fallback.get(key)
+	}
+	for _, memtable := range catalog.memtables {
+		if entry, ok := memtable.get(key); ok {
+			return entry, true
+		}
+	}
+	return fallback.get(key)
+}
+
 func (e *Engine) Put(key, value string) {
 	slog.Info("Put called", "key", key, "value", value)
+	catalog := e.PinCatalog()
+	defer e.ReleaseCatalog(catalog)
 
 	entry, err := newWALEntry(key, value, entryTypePut)
 	if err != nil {
@@ -139,6 +191,8 @@ func (e *Engine) Put(key, value string) {
 
 func (e *Engine) Delete(key string) {
 	slog.Info("Delete called", "key", key)
+	catalog := e.PinCatalog()
+	defer e.ReleaseCatalog(catalog)
 
 	//Lock to make sure that write to wal and mem table happen serially (Important for same file update)
 	start := time.Now()

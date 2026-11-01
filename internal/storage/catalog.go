@@ -52,7 +52,6 @@ func (cm *CatalogManager) AcquireCatalog() *Catalog {
 	defer cm.mu.Unlock()
 
 	if cm.active == nil {
-		log.Fatalf("CatalogManager: no active catalog")
 		return nil
 	}
 
@@ -64,11 +63,13 @@ func (cm *CatalogManager) ReleaseCatalog(catalog *Catalog) {
 	if catalog == nil {
 		return
 	}
-	if catalog.refCount.Add(-1) != 0 {
+	cm.mu.Lock()
+	if catalog.refCount.Load() <= 0 {
+		cm.mu.Unlock()
+		log.Printf("CatalogManager: attempted to release an unpinned catalog")
 		return
 	}
-	cm.mu.Lock()
-	if catalog.refCount.Load() != 0 || catalog == cm.active {
+	if catalog.refCount.Add(-1) != 0 || catalog == cm.active {
 		cm.mu.Unlock()
 		return
 	}
